@@ -1,0 +1,14 @@
+# build artifacts
+app
+*.o
+.build.log
+
+# example outputs (regenerate via tools/make-screenshots.sh)
+*.ppm
+out*.png
+pipe*.bin
+p18-validation/vl-local/
+
+# editor/OS noise
+*~
+.DS_Store
