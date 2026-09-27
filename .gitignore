@@ -12,3 +12,4 @@ p18-validation/vl-local/
 # editor/OS noise
 *~
 .DS_Store
+out*.jpg
