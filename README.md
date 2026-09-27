@@ -149,6 +149,8 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | 53 | `p53_letterbox` | Aspect-correct fit (letterbox) / fill (stretch) / cover (crop) from source + dest rects | [How to do aspect-correct letterboxing and cover cropping in Vulkan tile layouts](https://techoverflow.net/2026/09/27/how-to-do-aspect-correct-letterboxing-and-cover-cropping-in-vulkan-tile-layouts/) |
 | 57 | `p57_hevc` | HEVC Main10: FFmpeg `hevc_vaapi` → DRM-PRIME P010 → R16/R16G16 `VkImage` import | [How to decode HEVC Main10 with FFmpeg VA-API and import into Vulkan](https://techoverflow.net/2026/09/27/how-to-decode-hevc-main10-with-ffmpeg-va-api-and-import-into-vulkan/) |
 | 58 | `p58_httpmjpeg` | HTTP `multipart/x-mixed-replace` ingest: socket parser → FFmpeg JPEG decode → upload → render | [How to ingest HTTP MJPEG camera streams into Vulkan](https://techoverflow.net/2026/09/27/how-to-ingest-http-mjpeg-camera-streams-into-vulkan/) |
+| 67 | `p67_pngenc` | PNG encode in compute: adaptive scanline filters + zlib stored-block framing + Adler-32 | [How to encode PNG in a Vulkan compute shader](https://techoverflow.net/2026/09/27/how-to-encode-png-in-a-vulkan-compute-shader/) |
+| 68 | `p68_pngdec` | PNG decode in compute: full DEFLATE inflate (stored/fixed/dynamic + LZ77) + unfiltering | [How to decode PNG entirely on the GPU — DEFLATE inflate in a compute shader](https://techoverflow.net/2026/09/27/how-to-decode-png-entirely-on-the-gpu-deflate-inflate-in-a-compute-shader/) |
 
 ## Sample output
 
