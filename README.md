@@ -128,6 +128,14 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | 54 | `p54_descbuf` | `VK_EXT_descriptor_buffer` — opaque descriptor bytes in a mapped buffer, no pools/sets/updates | [How to use VK_EXT_descriptor_buffer — descriptors as plain buffer memory](https://techoverflow.net/2026/09/27/how-to-use-vk-ext-descriptor-buffer-descriptors-as-plain-buffer-memory/) |
 | 55 | `p55_localread` | `VK_KHR_dynamic_rendering_local_read` + `subpassLoad` — in-pass color feedback without a render pass | [How to read color attachments in the same render pass with VK_KHR_dynamic_rendering_local_read](https://techoverflow.net/2026/09/27/how-to-read-color-attachments-in-the-same-render-pass-with-vk-khr-dynamic-rendering-local-read/) |
 | 56 | `p56_timestamp` | `vkCmdWriteTimestamp` + `timestampPeriod` — measured GPU µs vs CPU submit-to-done wall time | [How to profile Vulkan GPU time with timestamp queries](https://techoverflow.net/2026/09/27/how-to-profile-vulkan-gpu-time-with-timestamp-queries/) |
+| 59 | `p59_shaderclock` | `VK_KHR_shader_clock` — in-shader `clock2x32ARB` deltas rendered as a per-pixel heatmap | [How to measure GPU cycles inside a shader with VK_KHR_shader_clock](https://techoverflow.net/2026/09/27/how-to-measure-gpu-cycles-inside-a-shader-with-vk-khr-shader-clock/) |
+| 60 | `p60_pipelexe` | `VK_KHR_pipeline_executable_properties` — SGPR/VGPR/spill stats + NIR/ACO/ISA dumps | [How to inspect compiled Vulkan shaders with VK_KHR_pipeline_executable_properties](https://techoverflow.net/2026/09/27/how-to-inspect-compiled-vulkan-shaders-with-vk-khr-pipeline-executable-properties/) |
+| 61 | `p61_indirect` | Compute culling → `vkCmdDrawIndirectCount` — 97 of 256 draws decided on-GPU | [How to do GPU-driven rendering in Vulkan with drawIndirectCount](https://techoverflow.net/2026/09/27/how-to-do-gpu-driven-rendering-in-vulkan-with-drawindirectcount/) |
+| 62 | `p62_subgroup` | `subgroupAdd`/`subgroupBallot`/`subgroupBroadcastFirst`/`subgroupShuffle` verified via SSBO | [How to use subgroup operations in Vulkan compute shaders](https://techoverflow.net/2026/09/27/how-to-use-subgroup-operations-in-vulkan-compute-shaders/) |
+| 63 | `p63_asynccompute` | Dedicated compute queue + timeline semaphore + timestamps — true graphics/compute overlap | [How to use a dedicated async compute queue in Vulkan](https://techoverflow.net/2026/09/27/how-to-use-a-dedicated-async-compute-queue-in-vulkan/) |
+| 64 | `p64_mesh` | `VK_EXT_mesh_shader` — task+mesh pipeline emits 4 procedural quads, zero vertex input | [How to replace the vertex pipeline with VK_EXT_mesh_shader](https://techoverflow.net/2026/09/27/how-to-replace-the-vertex-pipeline-with-vk-ext-mesh-shader/) |
+| 65 | `p65_shaderobject` | `VK_EXT_shader_object` — `VkShaderEXT` bound directly, all state via `vkCmdSet*EXT`, no `VkPipeline` | [How to use VK_EXT_shader_object — Vulkan without VkPipeline](https://techoverflow.net/2026/09/27/how-to-use-vk-ext-shader-object-vulkan-without-pipelines/) |
+| 66 | `p66_rayquery` | `VK_KHR_ray_query` — BLAS+TLAS build, hardware shadow ray per fragment in a normal pipeline | [How to do ray tracing in a fragment shader with VK_KHR_ray_query](https://techoverflow.net/2026/09/27/how-to-do-ray-tracing-in-a-fragment-shader-with-vk-khr-ray-query/) |
 
 ### Video & media pipeline
 
@@ -139,6 +147,8 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | 51 | `p51_gpujpeg` | Baseline JPEG encoder in a compute shader: per-MCU invocations, restart markers, SSBO segments | [How to encode JPEG in a Vulkan compute shader — parallel Huffman via restart markers](https://techoverflow.net/2026/09/27/how-to-encode-jpeg-in-a-vulkan-compute-shader-per-mcu-parallel-huffman/) |
 | 52 | `p52_text` | HarfBuzz shaping + FreeType + CPU SDF → `R8_UNORM` atlas, `smoothstep`/`fwidth` AA | [How to render text in Vulkan with an SDF glyph atlas (FreeType + HarfBuzz)](https://techoverflow.net/2026/09/27/how-to-render-text-in-vulkan-with-an-sdf-glyph-atlas-freetype-harfbuzz/) |
 | 53 | `p53_letterbox` | Aspect-correct fit (letterbox) / fill (stretch) / cover (crop) from source + dest rects | [How to do aspect-correct letterboxing and cover cropping in Vulkan tile layouts](https://techoverflow.net/2026/09/27/how-to-do-aspect-correct-letterboxing-and-cover-cropping-in-vulkan-tile-layouts/) |
+| 57 | `p57_hevc` | HEVC Main10: FFmpeg `hevc_vaapi` → DRM-PRIME P010 → R16/R16G16 `VkImage` import | [How to decode HEVC Main10 with FFmpeg VA-API and import into Vulkan](https://techoverflow.net/2026/09/27/how-to-decode-hevc-main10-with-ffmpeg-va-api-and-import-into-vulkan/) |
+| 58 | `p58_httpmjpeg` | HTTP `multipart/x-mixed-replace` ingest: socket parser → FFmpeg JPEG decode → upload → render | [How to ingest HTTP MJPEG camera streams into Vulkan](https://techoverflow.net/2026/09/27/how-to-ingest-http-mjpeg-camera-streams-into-vulkan/) |
 
 ## Sample output
 
@@ -148,6 +158,8 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | ![bindless](screenshots/p37_bindless.png) | ![ycbcr](screenshots/p38_ycbcr.png) | ![multiview](screenshots/p45_multiview.png) |
 | ![dmabuf](screenshots/p39_dmabuf.png) | ![localread](screenshots/p35-localread.png) | ![blur](screenshots/p33-blur.png) |
 | ![v4l2 webcam](screenshots/p48_v4l2.png) | ![video wall](screenshots/p50_wall.png) | ![sdf text](screenshots/p52_text.png) |
+| ![hevc main10](screenshots/p57_hevc.png) | ![shaderclock heatmap](screenshots/p59_shaderclock.png) | ![mesh shader](screenshots/p64_mesh.png) |
+| ![indirect draws](screenshots/p61_indirect.png) | ![ray query shadows](screenshots/p66_rayquery.png) | ![shader objects](screenshots/p65_shaderobject.png) |
 
 More in [`screenshots/`](screenshots/) — all regenerated by
 `tools/make-screenshots.sh`.
