@@ -14,3 +14,10 @@ g++ -std=c++23 -O2 main.cpp -o app -lvulkan -lglfw -lshaderc
 
 See the [repository README](../README.md) for dependencies and the
 shared `vkmini.hpp` helper.
+
+## Visual comparison
+
+![input vs decoded output vs diff](compare.png)
+
+`./compare.py` rebuilds if needed, decodes the output via PIL and writes
+`compare.png`: source | decoded | |diff| x8.
