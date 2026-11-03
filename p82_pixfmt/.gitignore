@@ -1,0 +1,3 @@
+.check/
+__pycache__/
+*.raw
