@@ -2127,8 +2127,18 @@ int main(int argc, char** argv) {
                                size_t(ckBase[jobs[j0].si]) * 12,
                            sc0.survSt.data(), sc0.survSt.size() * 4);
                 } else {
-                    fprintf(stderr, "deferred survey failed (scan %u)\n",
+                    // degrade to a single serial chunk: entry 0 covers
+                    // the whole scan from its data offset (flag 0 =
+                    // fresh state); remaining slots get nMcu=0.
+                    fprintf(stderr,
+                            "deferred survey failed (scan %u) — serial\n",
                             jobs[j0].si);
+                    const uint32_t si = jobs[j0].si;
+                    uint32_t* ck = static_cast<uint32_t*>(ivBuf.mapped) +
+                                   size_t(ckBase[si]) * 4;
+                    memset(ck, 0, nIvV[si] * 4 * sizeof(uint32_t));
+                    ck[0] = sc0.dataOff;
+                    ck[2] = sc0.totalMcus;
                 }
             }
             g.v.oneTime([&](vk::CommandBuffer c) {
