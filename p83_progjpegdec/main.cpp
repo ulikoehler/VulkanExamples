@@ -89,6 +89,10 @@ struct Scan {
     HuffTable dctab[4], actab[4];
     uint16_t qt[4][64]{};
     bool tablesChanged = false;  // differs from previous scan's set
+    // DRI=0 scans get "virtual restart intervals" from the survey
+    // pass: 12 st[] words (bitreader + pred + eobrun) per interval,
+    // preloaded by the host instead of chained from a predecessor.
+    std::vector<uint32_t> survSt;  // intervals.size()*12 when nonempty
 };
 
 struct Jpg {
@@ -107,7 +111,38 @@ struct Jpg {
     std::vector<Scan> scans;
     int totalMcus = 0;
     bool progressive = false;
+    int orient = 1;              // EXIF orientation tag (APP1), 1..8
 };
+
+// APP1 "Exif\0\0" TIFF -> orientation tag 0x0112 (default 1).
+static int parseExifOrient(const uint8_t* s, uint32_t n) {
+    if (n < 14 || memcmp(s, "Exif\0\0", 6) != 0) return 1;
+    const uint8_t* t = s + 6;
+    bool le = t[0] == 'I';
+    if (!le && !(t[0] == 'M' && t[1] == 'M')) return 1;
+    auto u16 = [&](uint32_t o) {
+        return le ? t[o] | (t[o + 1] << 8) : (t[o] << 8) | t[o + 1];
+    };
+    auto u32 = [&](uint32_t o) {
+        return le ? t[o] | (t[o + 1] << 8) | (t[o + 2] << 16) |
+                        (uint32_t(t[o + 3]) << 24)
+                  : (t[o] << 24) | (t[o + 1] << 16) | (t[o + 2] << 8) |
+                        t[o + 3];
+    };
+    if (u16(2) != 42) return 1;
+    uint32_t ifd = u32(4);
+    if (ifd + 2 > uint32_t(n) - 6) return 1;
+    uint32_t cnt = u16(ifd);
+    for (uint32_t i = 0; i < cnt; ++i) {
+        uint32_t e = ifd + 2 + i * 12;
+        if (e + 12 > uint32_t(n) - 6) break;
+        if (u16(e) == 0x0112 && u16(e + 2) == 3) {
+            int v = u16(e + 8);
+            return v >= 1 && v <= 8 ? v : 1;
+        }
+    }
+    return 1;
+}
 
 static void buildCanon(HuffTable& t) {
     int code = 0, k = 0;
@@ -194,6 +229,9 @@ static bool parseJpg(Jpg& j) {
             }
             break;
         }
+        case 0xE1: // APP1: EXIF orientation
+            j.orient = parseExifOrient(s, slen);
+            break;
         case 0xC0: case 0xC1: case 0xC2: { // SOF0/1 sequential, SOF2 progressive
             if (s[0] != 8) {
                 fprintf(stderr, "unsupported precision %d\n", s[0]);
@@ -414,36 +452,312 @@ static void packTables(const Scan& sc, std::vector<int32_t>& tab) {
 
 // Per-component params, 16 int32 words each (binding 4, entropy, recon
 // and upsample read it):
-//   0 hs  1 vs  2 bw  3 bh  4 w  5 h  6 qt  7 dcTab  8 acTab
-//   9 coefOfs(words)  10 planeOfs(bytes)  11 wib  12 hib  13..15 pad
+//   0 hs  1 vs  2 bw  3 bh  4 downW  5 downH  6 qt  7 pad  8 pad
+//   9 coefOfs(words)  10 planeOfs(bytes)  11 wib  12 hib  13 ss  14,15 pad
 struct FrameGpu {
     int32_t comps[4][16];
     int32_t totalBlocks, planeWords, nIntervals;
 };
 
-static FrameGpu packComps(const Jpg& j) {
+static FrameGpu packComps(const Jpg& j, int smin = 8) {
     FrameGpu f{};
     uint32_t coefOf = 0, planeOf = 0;
     for (int i = 0; i < 4; ++i) {
         const Comp& c = j.comps[i];
+        // jdmaster: double the per-comp IDCT scale while the sampling
+        // grid still divides evenly — chroma gets a bigger IDCT instead
+        // of upsampling (4:2:0 chroma -> ss 8 at scale 1/2, -> ss 2 at 1/8)
+        int ss = smin;
+        while (ss < 8 &&
+               (j.maxH * smin) % (c.hs * ss * 2) == 0 &&
+               (j.maxV * smin) % (c.vs * ss * 2) == 0)
+            ss *= 2;
+        int downW = int((int64_t(j.W) * c.hs * ss + j.maxH * 8 - 1) /
+                        (j.maxH * 8));
+        int downH = int((int64_t(j.H) * c.vs * ss + j.maxV * 8 - 1) /
+                        (j.maxV * 8));
         f.comps[i][0] = c.hs;  f.comps[i][1] = c.vs;
         f.comps[i][2] = c.bw;  f.comps[i][3] = c.bh;
-        f.comps[i][4] = c.w;   f.comps[i][5] = c.h;
+        f.comps[i][4] = downW; f.comps[i][5] = downH;
         f.comps[i][6] = c.tq;
-        f.comps[i][7] = 0;             // tables now come per-scan
+        f.comps[i][7] = 0;
         f.comps[i][8] = 0;
         f.comps[i][9] = int32_t(coefOf);
         f.comps[i][10] = int32_t(planeOf);
         f.comps[i][11] = c.wib;
         f.comps[i][12] = c.hib;
+        f.comps[i][13] = i < j.nComp ? ss : 8;
         if (i < j.nComp) {
             coefOf += uint32_t(c.bw) * c.bh * 32;      // 64 coefs / 2 per word
-            planeOf += uint32_t(c.bw * 8) * (c.bh * 8);    // plane bytes
+            // plane: ss<=2 word-per-sample, else byte-per-sample
+            int64_t px = int64_t(c.bw * ss) * (c.bh * ss);
+            planeOf += uint32_t(ss <= 2 ? px * 4 : px);
         }
         f.totalBlocks += c.bw * c.bh;
     }
     f.planeWords = int32_t(planeOf / 4);
     return f;
+}
+
+// Scan -> entropy mode. AC bands are always non-interleaved (ns==1);
+// DC bands may be interleaved or per-component.
+static int scanMode(const Scan& sc) {
+    if (sc.ss == 0 && sc.se == 63 && sc.ah == 0 && sc.al == 0)
+        return 0;                        // sequential full band
+    if (sc.ss == 0) return sc.ah == 0 ? 1 : 2;
+    return sc.ah == 0 ? 3 : 4;
+}
+
+// ============================================================
+//  Survey pass: virtual restart intervals for DRI=0 scans.
+//
+//  A serial Huffman walk over the entropy stream that consumes
+//  symbols exactly like the GPU kernel — but only tracks decoder
+//  state, never coefficient storage. At every kSurveyIv MCUs it
+//  snapshots (pos, buf, cnt, end, pad, pred, eobrun): those become
+//  "virtual restart intervals" — preloaded state turns the serial
+//  stream back into independent parallel work items. Costs a few
+//  percent of a full decode; AC-refine scans additionally need the
+//  coefficient buffer from prior scans (deferred survey, done after
+//  those scans' GPU dispatch completes).
+// ============================================================
+static constexpr uint32_t kSurveyIv = 256;   // MCUs per virtual interval
+
+struct SBit {
+    const uint8_t* d; uint32_t len;
+    uint32_t pos = 0, buf = 0; int cnt = 0; bool end = false; int pad = 0;
+
+    uint8_t byteAt(uint32_t p) const { return d[p]; }
+    uint32_t rdByte() {
+        if (end) return 0xFFu;
+        uint32_t v = byteAt(pos);
+        if (v != 0xFFu) { pos++; return v; }
+        uint32_t p = pos + 1, n = 0xFFu;
+        while (n == 0xFFu && p < len) {
+            n = byteAt(p);
+            if (n == 0xFFu) p++;
+        }
+        if (n == 0u) { pos = p + 1; return 0xFFu; }
+        end = true;
+        return 0xFFu;
+    }
+    void fill() {
+        while (cnt <= 24) {
+            uint32_t v = rdByte();
+            buf = (buf << 8) | v; cnt += 8;
+            if (end) pad += 8;
+        }
+    }
+    uint32_t peekN(uint32_t n) {
+        fill();
+        if (uint32_t(cnt) >= n) return (buf >> (cnt - int(n))) & ((1u << n) - 1u);
+        uint32_t real = uint32_t(cnt);
+        uint32_t v = (buf & ((1u << real) - 1u)) << (n - real);
+        return v | ((1u << (n - real)) - 1u);
+    }
+    void eat(uint32_t n) {
+        cnt = (uint32_t(cnt) >= n) ? cnt - int(n) : 0;
+        if (pad > cnt) pad = cnt;
+        buf &= (cnt >= 32) ? 0xFFFFFFFFu : ((1u << uint32_t(cnt)) - 1u);
+    }
+    uint32_t get1() { uint32_t v = peekN(1); eat(1); return v; }
+    int rext(int s) {
+        if (!s) return 0;
+        int i = int(peekN(uint32_t(s))); eat(uint32_t(s));
+        return (i < (1 << (s - 1))) ? i - (1 << s) + 1 : i;
+    }
+};
+
+static int hdec(SBit& b, const HuffTable& t) {
+    int code = 0;
+    for (int l = 1; l <= 16; ++l) {
+        code = (code << 1) | int(b.get1());
+        if (t.maxcode[l - 1] >= 0 && code <= t.maxcode[l - 1])
+            return t.vals[t.valptr[l - 1] + code];
+    }
+    return -1;                                   // corrupt stream
+}
+
+// coef access for AC-refine surveys — same zigzag-pair packing as the
+// GPU coef buffer. Returns 0 when no coefficient data is available.
+struct SurvCoef {
+    const uint32_t* w = nullptr;
+    int get(uint32_t outp, int k) const {
+        if (!w) return 0;
+        uint32_t w2 = w[outp + uint32_t(k >> 1)];
+        int v = int((w2 >> ((k & 1) * 16)) & 0xFFFFu);
+        return (v >= 32768) ? v - 65536 : v;
+    }
+};
+
+// One scan's entropy stream -> virtual interval table + per-interval
+// preloaded st[] state. Mirrors the shader's per-MCU symbol walk for
+// all five modes; mode 4 additionally reads coefs (nonzero walk).
+// Returns false on unrecoverable stream corruption.
+static bool surveyScan(const Jpg& j, Scan& sc, const SurvCoef& coef,
+                       const FrameGpu& fg) {
+    const int mode = scanMode(sc);
+    for (int t = 0; t < 4; ++t) {
+        buildCanon(const_cast<HuffTable&>(sc.dctab[t]));
+        buildCanon(const_cast<HuffTable&>(sc.actab[t]));
+    }
+    SBit b{j.data.data(), uint32_t(j.data.size())};
+    b.pos = sc.dataOff;
+    int32_t pred[4] = {};
+    uint32_t eobrun = 0;
+    sc.intervals.clear();
+    sc.survSt.clear();
+    const uint32_t total = sc.totalMcus;
+
+    auto snap = [&](uint32_t mcuStart) {
+        if (!sc.intervals.empty())
+            sc.intervals.back().nMcu =
+                mcuStart - sc.intervals.back().mcuStart;
+        Interval iv{b.pos - sc.dataOff, mcuStart, 0};
+        sc.intervals.push_back(iv);
+        const uint32_t sw[12] = {b.pos, b.buf, uint32_t(b.cnt),
+                                 b.end ? 1u : 0u,
+                                 uint32_t(pred[0]), uint32_t(pred[1]),
+                                 uint32_t(pred[2]), uint32_t(pred[3]),
+                                 eobrun, uint32_t(b.pad), 0, 0};
+        sc.survSt.insert(sc.survSt.end(), sw, sw + 12);
+    };
+
+    for (uint32_t mcu = 0; mcu < total; ++mcu) {
+        if (mcu % kSurveyIv == 0) snap(mcu);
+        if (!(b.end && b.cnt <= b.pad)) {
+            // decode this MCU's symbols (skip only when nothing but
+            // marker padding remains — mirrors the shader's check)
+            if (sc.ns > 1) {
+                int mx = int(mcu) % j.mcusX, my = int(mcu) / j.mcusX;
+                for (int ci = 0; ci < sc.ns; ++ci) {
+                    const Comp& c = j.comps[sc.sc[ci].comp];
+                    const HuffTable &dt = sc.dctab[sc.sc[ci].td],
+                                    &at = sc.actab[sc.sc[ci].ta];
+                    uint32_t cofs = uint32_t(fg.comps[sc.sc[ci].comp][9]);
+                    for (int v = 0; v < c.vs; ++v)
+                    for (int h = 0; h < c.hs; ++h) {
+                        int bi = (my * c.vs + v) * c.bw + mx * c.hs + h;
+                        uint32_t outp = cofs + uint32_t(bi) * 32u;
+                        if (mode == 0) {
+                            int s = hdec(b, dt);
+                            if (s < 0) return false;
+                            pred[ci] += b.rext(s);
+                            int k = 1;
+                            while (k < 64) {
+                                int sym = hdec(b, at);
+                                if (sym < 0) return false;
+                                int r = sym >> 4; s = sym & 15;
+                                if (!s) {
+                                    if (r == 15) { k += 16; continue; }
+                                    break;
+                                }
+                                k += r;
+                                if (s) b.rext(s);   // consumed even OOB
+                                k++;
+                            }
+                        } else if (mode == 1) {
+                            int s = hdec(b, dt);
+                            if (s < 0) return false;
+                            pred[ci] += b.rext(s);
+                        } else if (mode == 2) {
+                            b.get1();
+                        }
+                    }
+                }
+            } else {
+                int comp = sc.sc[0].comp;
+                const HuffTable &dt = sc.dctab[sc.sc[0].td],
+                                &at = sc.actab[sc.sc[0].ta];
+                int wib1 = j.comps[comp].wib, bw = j.comps[comp].bw;
+                uint32_t cofs = uint32_t(fg.comps[comp][9]);
+                int bx = int(mcu) % wib1, by = int(mcu) / wib1;
+                uint32_t outp = cofs + uint32_t(by * bw + bx) * 32u;
+                if (mode == 0 || mode == 1) {
+                    int s = hdec(b, dt);
+                    if (s < 0) return false;
+                    pred[0] += b.rext(s);
+                    if (mode == 0) {
+                        int k = 1;
+                        while (k < 64) {
+                            int sym = hdec(b, at);
+                            if (sym < 0) return false;
+                            int r = sym >> 4; s = sym & 15;
+                            if (!s) {
+                                if (r == 15) { k += 16; continue; }
+                                break;
+                            }
+                            k += r;
+                            if (s) b.rext(s);       // consumed even OOB
+                            k++;
+                        }
+                    }
+                } else if (mode == 2) {
+                    b.get1();
+                } else if (mode == 3) {
+                    if (eobrun > 0u) { eobrun--; }
+                    else {
+                        int k = sc.ss;
+                        while (k <= sc.se) {
+                            int sym = hdec(b, at);
+                            if (sym < 0) return false;
+                            int r = sym >> 4, s = sym & 15;
+                            if (s) {
+                                k += r;
+                                if (s) b.rext(s);   // consumed even OOB
+                                k++;
+                            } else if (r == 15) {
+                                k += 16;
+                            } else {
+                                eobrun = 1u << r;
+                                if (r) eobrun += b.peekN(uint32_t(r));
+                                if (r) b.eat(uint32_t(r));
+                                eobrun--;
+                                break;
+                            }
+                        }
+                    }
+                } else {   // mode 4 — AC refinement
+                    int k = sc.ss;
+                    if (eobrun == 0u) {
+                        while (k <= sc.se) {
+                            int sym = hdec(b, at);
+                            if (sym < 0) return false;
+                            int r = sym >> 4, s = sym & 15;
+                            if (s == 0 && r != 15) {
+                                eobrun = 1u << r;
+                                if (r) eobrun += b.peekN(uint32_t(r));
+                                if (r) b.eat(uint32_t(r));
+                                break;
+                            }
+                            if (s != 0) b.get1();   // new-coef sign bit
+                            do {
+                                int v = coef.get(outp, k);
+                                if (v != 0) {
+                                    b.get1();      // correction bit
+                                } else {
+                                    r--;
+                                    if (r < 0) break;
+                                }
+                                k++;
+                            } while (k <= sc.se);
+                            k++;
+                        }
+                    }
+                    if (eobrun > 0u) {
+                        for (; k <= sc.se; ++k) {
+                            if (coef.get(outp, k) != 0) b.get1();
+                        }
+                        eobrun--;
+                    }
+                }
+            }
+        }
+    }
+    // close the last interval
+    if (!sc.intervals.empty())
+        sc.intervals.back().nMcu = total - sc.intervals.back().mcuStart;
+    return true;
 }
 
 // ============================================================
@@ -457,7 +771,8 @@ struct Ref {
     int W = 0, H = 0;
 };
 
-static bool refDecode(const std::string& path, Ref& r, bool wantCoefs) {
+static bool refDecode(const std::string& path, Ref& r, bool wantCoefs,
+                      int scaleNum = 1, int scaleDenom = 1) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
     jpeg_decompress_struct cinfo{};
@@ -466,6 +781,8 @@ static bool refDecode(const std::string& path, Ref& r, bool wantCoefs) {
     jpeg_create_decompress(&cinfo);
     jpeg_stdio_src(&cinfo, f);
     jpeg_read_header(&cinfo, TRUE);
+    cinfo.scale_num = JDIMENSION(scaleNum);
+    cinfo.scale_denom = JDIMENSION(scaleDenom);
 
     if (wantCoefs) {
         jvirt_barray_ptr* arr = jpeg_read_coefficients(&cinfo);
@@ -782,8 +1099,10 @@ void main() {
         b.pos = w.x; b.buf = 0u; b.cnt = 0; b.end = false;
         b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u; b.pad = 0;
         pred = ivec4(0);
-    } else {                                      // resume predecessor's state
-        uint s = (idx - nIv) * 12u;
+    } else {
+        // w.w == 1: resume predecessor generation's state at idx-nIv;
+        // w.w == 2: host-surveyed "virtual restart" state at own slot
+        uint s = (w.w == 1u ? idx - nIv : idx) * 12u;
         b.pos = st[s]; b.buf = st[s + 1]; b.cnt = int(st[s + 2]);
         b.end = st[s + 3] != 0u;
         b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u;
@@ -859,7 +1178,8 @@ layout(set = 0, binding = 4) uniform Comps { ivec4 comps[4][4]; };
 layout(set = 0, binding = 5) readonly buffer Coef { uint coef[]; };
 layout(set = 0, binding = 6) writeonly buffer Planes { uint planes[]; };
 layout(push_constant) uniform P { uint W, H, mcusX, nComp, maxH, maxV,
-                                  nIv, scanLen, tabOfs; };
+                                  nIv, scanLen, tabOfs;
+                                  uint winX0, winY0, winX1, winY1; };
 
 const int zig[64] = int[64](
     0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,
@@ -896,6 +1216,81 @@ void idct1d(in int inp[8], out int outp[8], int sc, int nsh) {
     outp[3] = desc(t13 + t0, nsh); outp[4] = desc(t13 - t0, nsh);
 }
 
+// --- scaled IDCTs (jidctred.c): reduced-size 4x4/2x2/1x1, bit-exact ---
+// column pass for the 4x4 variant: reads rows 0-3,5-7 of one input
+// column (already dequantized, natural order) -> ws[4] at wsptr[c].
+void idct44col(in int deq[64], int col, inout int ws[32]) {
+    if (deq[8 + col] == 0 && deq[16 + col] == 0 && deq[24 + col] == 0 &&
+        deq[40 + col] == 0 && deq[48 + col] == 0 && deq[56 + col] == 0) {
+        int dcval = deq[col] << 2;              // PASS1_BITS
+        ws[col] = dcval; ws[8 + col] = dcval;
+        ws[16 + col] = dcval; ws[24 + col] = dcval;
+        return;
+    }
+    int tmp0 = deq[col] << 14;                  // CONST_BITS+1
+    int z2 = deq[16 + col], z3 = deq[48 + col];
+    int tmp2 = z2 * 15137 + z3 * -6270;         // 1.847759065, -0.765366865
+    int tmp10 = tmp0 + tmp2, tmp12 = tmp0 - tmp2;
+    int z1 = deq[56 + col]; z2 = deq[40 + col];
+    z3 = deq[24 + col]; int z4 = deq[8 + col];
+    tmp0 = z1 * -1730 + z2 * 11893 + z3 * -17799 + z4 * 8697;
+    tmp2 = z1 * -4176 + z2 * -4926 + z3 * 7373 + z4 * 20995;
+    ws[col]      = desc(tmp10 + tmp2, 12);      // CONST_BITS-PASS1_BITS+1
+    ws[24 + col] = desc(tmp10 - tmp2, 12);
+    ws[8 + col]  = desc(tmp12 + tmp0, 12);
+    ws[16 + col] = desc(tmp12 - tmp0, 12);
+}
+// row pass: ws row r -> 4 u8 samples
+void idct44row(in int ws[32], int r, inout uint w) {
+    if (ws[r * 8 + 1] == 0 && ws[r * 8 + 2] == 0 && ws[r * 8 + 3] == 0 &&
+        ws[r * 8 + 5] == 0 && ws[r * 8 + 6] == 0 && ws[r * 8 + 7] == 0) {
+        int dcval = clamp(desc(ws[r * 8], 5) + 128, 0, 255);
+        w = uint(dcval) * 0x01010101u;
+        return;
+    }
+    int tmp0 = ws[r * 8] << 14;
+    int tmp2 = ws[r * 8 + 2] * 15137 + ws[r * 8 + 6] * -6270;
+    int tmp10 = tmp0 + tmp2, tmp12 = tmp0 - tmp2;
+    int z1 = ws[r * 8 + 7], z2 = ws[r * 8 + 5];
+    int z3 = ws[r * 8 + 3], z4 = ws[r * 8 + 1];
+    tmp0 = z1 * -1730 + z2 * 11893 + z3 * -17799 + z4 * 8697;
+    tmp2 = z1 * -4176 + z2 * -4926 + z3 * 7373 + z4 * 20995;
+    w = uint(clamp(desc(tmp10 + tmp2, 19) + 128, 0, 255)) |
+        (uint(clamp(desc(tmp12 + tmp0, 19) + 128, 0, 255)) << 8) |
+        (uint(clamp(desc(tmp12 - tmp0, 19) + 128, 0, 255)) << 16) |
+        (uint(clamp(desc(tmp10 - tmp2, 19) + 128, 0, 255)) << 24);
+}
+
+// 2x2 variant: columns 0,1,3,5,7 (skip 2,4,6) -> ws[2] per column
+void idct22col(in int deq[64], int col, inout int ws[16]) {
+    if (deq[8 + col] == 0 && deq[24 + col] == 0 && deq[40 + col] == 0 &&
+        deq[56 + col] == 0) {
+        int dcval = deq[col] << 2;
+        ws[col] = dcval; ws[8 + col] = dcval;
+        return;
+    }
+    int tmp10 = deq[col] << 15;                 // CONST_BITS+2
+    int tmp0 = deq[56 + col] * -5906 +          // c7-c5+c3-c1
+               deq[40 + col] * 6967 +           // -c1+c3+c5+c7
+               deq[24 + col] * -10426 +         // -c1+c3-c5-c7
+               deq[8 + col] * 29692;            // c1+c3+c5+c7
+    ws[col]     = desc(tmp10 + tmp0, 13);       // CONST_BITS-PASS1_BITS+2
+    ws[8 + col] = desc(tmp10 - tmp0, 13);
+}
+void idct22row(in int ws[16], int r, inout uint w) {
+    if (ws[r * 8 + 1] == 0 && ws[r * 8 + 3] == 0 && ws[r * 8 + 5] == 0 &&
+        ws[r * 8 + 7] == 0) {
+        int dcval = clamp(desc(ws[r * 8], 5) + 128, 0, 255);
+        w = uint(dcval) * 0x01010101u;
+        return;
+    }
+    int tmp10 = ws[r * 8] << 15;
+    int tmp0 = ws[r * 8 + 7] * -5906 + ws[r * 8 + 5] * 6967 +
+               ws[r * 8 + 3] * -10426 + ws[r * 8 + 1] * 29692;
+    w = uint(clamp(desc(tmp10 + tmp0, 20) + 128, 0, 255)) |
+        (uint(clamp(desc(tmp10 - tmp0, 20) + 128, 0, 255)) << 8);
+}
+
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     // find which component this block belongs to (bounded — dispatch
@@ -907,7 +1302,19 @@ void main() {
     if (c >= int(nComp) || int(gid) >= CM(c, 2) * CM(c, 3)) return;
     int bw = CM(c, 2);
     int bx = int(gid) % bw, by = int(gid) / bw;
+    // crop: skip blocks outside the needed source region (block bx
+    // covers src px [bx*8*maxH/hs, ..) — same window math as host)
+    {
+        int hs = CM(c, 0), vs = CM(c, 1);
+        int sx = 8 * int(maxH), sy = 8 * int(maxV);
+        int bx0 = int(winX0) * hs / sx;
+        int bx1 = (int(winX1) * hs + sx - 1) / sx;
+        int by0 = int(winY0) * vs / sy;
+        int by1 = (int(winY1) * vs + sy - 1) / sy;
+        if (bx < bx0 || bx >= bx1 || by < by0 || by >= by1) return;
+    }
     int qt = CM(c, 6);
+    int ss = CM(c, 13);                        // per-comp DCT_scaled_size
     uint cofs = uint(CM(c, 9));
     uint pofs = uint(CM(c, 10)) >> 2;        // bytes -> words
 
@@ -919,6 +1326,42 @@ void main() {
         int v1 = int(w2 >> 16);     if (v1 >= 32768) v1 -= 65536;
         deq[zig[i]]     = v0 * T(qt * 64 + zig[i]);
         deq[zig[i + 1]] = v1 * T(qt * 64 + zig[i + 1]);
+    }
+
+    // ss in {1,2}: plane is word-per-sample (byte packing would race
+    // between neighbouring blocks sharing a word); ss in {4,8} is
+    // byte-packed (block tiles stay word-aligned)
+    int stride = bw * ss;
+    if (ss == 1) {                             // 1x1: scaled DC average
+        planes[pofs + uint(by * stride + bx)] =
+            uint(clamp(desc(deq[0], 3) + 128, 0, 255));
+        return;
+    }
+    if (ss == 2) {
+        int ws[16];
+        for (int col = 0; col < 8; ++col) {
+            if (col == 2 || col == 4 || col == 6) continue;
+            idct22col(deq, col, ws);
+        }
+        for (int r = 0; r < 2; ++r) {
+            uint w = 0u; idct22row(ws, r, w);
+            uint base = pofs + uint((by * 2 + r) * stride + bx * 2);
+            planes[base] = w & 0xFFu;
+            planes[base + 1] = (w >> 8) & 0xFFu;
+        }
+        return;
+    }
+    if (ss == 4) {
+        int ws[32];
+        for (int col = 0; col < 8; ++col) {
+            if (col == 4) continue;
+            idct44col(deq, col, ws);
+        }
+        for (int r = 0; r < 4; ++r) {
+            uint w = 0u; idct44row(ws, r, w);
+            planes[pofs + (uint((by * 4 + r) * stride + bx * 4) >> 2)] = w;
+        }
+        return;
     }
 
     // pass 1: columns (dequant inside the pass, like jidctint)
@@ -961,12 +1404,18 @@ layout(set = 0, binding = 4) uniform Comps { ivec4 comps[4][4]; };
 #define CM(c, i) (comps[c][(i) >> 2][(i) & 3])
 layout(set = 0, binding = 6) readonly buffer Planes { uint planes[]; };
 layout(set = 0, binding = 7) writeonly buffer OutB { uint outp[]; };
-layout(push_constant) uniform P { uint W, H, mcusX, nComp, maxH, maxV, nIv, scanLen; };
+layout(push_constant) uniform P { uint W, H, mcusX, nComp, maxH, maxV,
+                                  nIv, scanLen, smin;
+                                  uint cropX, cropY, uW, uH, orient; };
 
-// fetch one u8 sample from component c's packed plane
+// fetch one sample from component c's plane; ss in {1,2} planes are
+// word-per-sample, {4,8} byte-packed — matches the recon stage
 int smp(int c, int x, int y) {
     uint pofs = uint(CM(c, 10));
-    int stride = CM(c, 2) * 8;               // samples per plane row
+    int ss = CM(c, 13);
+    if (ss <= 2)   // word-per-sample: pofs>>2 + word index
+        return int(planes[(pofs >> 2) + uint(y * CM(c, 2) * ss + x)]);
+    int stride = CM(c, 2) * ss;                // samples per plane row
     uint a = pofs + uint(y * stride + x);
     return int((planes[a >> 2] >> ((a & 3u) * 8u)) & 0xFFu);
 }
@@ -977,10 +1426,14 @@ int clampi(int v) { return clamp(v, 0, 255); }
 int usamp(int c, int x, int y) {
     int hs = CM(c, 0), vs = CM(c, 1);
     int cw = CM(c, 4), ch = CM(c, 5);
-    int rh = int(maxH) / hs, rv = int(maxV) / vs;
+    int ss = CM(c, 13);
+    // jdsample group math: input group = samp*ss/min_ssize vs max_samp
+    int rh = (int(maxH) * int(smin)) / (hs * ss);
+    int rv = (int(maxV) * int(smin)) / (vs * ss);
+    bool fancy = smin > 1u;                    // do_fancy && min>1
     if (rh == 1 && rv == 1)
         return smp(c, x, y);
-    if (rh == 2 && rv == 1) {                    // h2v1 fancy
+    if (fancy && rh == 2 && rv == 1 && cw > 2) {  // h2v1 fancy
         int j = clamp(x >> 1, 0, cw - 1);
         if (x == 0) return smp(c, 0, y);
         if (x == cw * 2 - 1) return smp(c, cw - 1, y);
@@ -988,13 +1441,13 @@ int usamp(int c, int x, int y) {
             return (3 * smp(c, j, y) + smp(c, j - 1, y) + 1) >> 2;
         return (3 * smp(c, j, y) + smp(c, j + 1, y) + 2) >> 2;
     }
-    if (rh == 1 && rv == 2) {                    // h1v2 fancy
+    if (fancy && rh == 1 && rv == 2) {           // h1v2 fancy
         int i = clamp(y >> 1, 0, ch - 1);
         int adj = clamp(i + (((y & 1) == 0) ? -1 : 1), 0, ch - 1);
         int bias = ((y & 1) == 0) ? 1 : 2;
         return (3 * smp(c, x, i) + smp(c, x, adj) + bias) >> 2;
     }
-    if (rh == 2 && rv == 2 && cw > 2) {          // h2v2 fancy
+    if (fancy && rh == 2 && rv == 2 && cw > 2) { // h2v2 fancy
         int i = clamp(y >> 1, 0, ch - 1);
         int i2 = clamp(i + (((y & 1) == 0) ? -1 : 1), 0, ch - 1);
         int j = clamp(x >> 1, 0, cw - 1);
@@ -1006,22 +1459,39 @@ int usamp(int c, int x, int y) {
         int bias = ((x & 1) == 0) ? 8 : 7;
         return (this0 * 3 + adj0 + bias) >> 4;
     }
-    // integral factors: plain replication
+    // integral factors: plain replication (also non-fancy h2v1/h2v2)
     int cx = clamp(x / rh, 0, cw - 1);
     int cy = clamp(y / rv, 0, ch - 1);
     return smp(c, cx, cy);
 }
 
+// EXIF orientation: final output (x,y) -> un-oriented coords (uW x uH)
+ivec2 omap(int x, int y) {
+    switch (orient) {
+    case 2u: return ivec2(int(uW) - 1 - x, y);
+    case 3u: return ivec2(int(uW) - 1 - x, int(uH) - 1 - y);
+    case 4u: return ivec2(x, int(uH) - 1 - y);
+    case 5u: return ivec2(y, x);
+    case 6u: return ivec2(y, int(uH) - 1 - x);
+    case 7u: return ivec2(int(uW) - 1 - y, int(uH) - 1 - x);
+    case 8u: return ivec2(int(uW) - 1 - y, x);
+    default: return ivec2(x, y);
+    }
+}
+
 void main() {
     uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
     if (x >= W || y >= H) return;
+    // crop selects a rect of the ORIENTED image; omap maps back to the
+    // un-oriented plane coordinates the samplers index
+    ivec2 uv = omap(int(x) + int(cropX), int(y) + int(cropY));
     int r, g, bl;
     if (nComp == 1u) {
-        r = g = bl = usamp(0, int(x), int(y));
+        r = g = bl = usamp(0, uv.x, uv.y);
     } else {
-        int yy = usamp(0, int(x), int(y));
-        int cb = usamp(1, int(x), int(y)) - 128;
-        int cr = usamp(2, int(x), int(y)) - 128;
+        int yy = usamp(0, uv.x, uv.y);
+        int cb = usamp(1, uv.x, uv.y) - 128;
+        int cr = usamp(2, uv.x, uv.y) - 128;
         r = clampi(yy + ((91881 * cr + 32768) >> 16));
         g = clampi(yy + ((32768 - 22554 * cb - 46802 * cr) >> 16));
         bl = clampi(yy + ((116130 * cb + 32768) >> 16));
@@ -1107,6 +1577,39 @@ struct Gpu {
     }
 };
 
+// Host mirror of the shader crop+orient path: un-oriented RGB uW x uH
+// -> oriented (orient transform), then crop [x,y,w,h) in oriented
+// space. Returns (rgb, W, H) of the final image.
+struct RgbImg { std::vector<uint8_t> px; int W = 0, H = 0; };
+
+static RgbImg cropOrientRgb(const std::vector<uint8_t>& rgb, int uW,
+                            int uH, int orient, int cx, int cy, int cw,
+                            int ch) {
+    auto omap = [&](int x, int y) {
+        switch (orient) {
+        case 2: return std::pair{uW - 1 - x, y};
+        case 3: return std::pair{uW - 1 - x, uH - 1 - y};
+        case 4: return std::pair{x, uH - 1 - y};
+        case 5: return std::pair{y, x};
+        case 6: return std::pair{y, uH - 1 - x};
+        case 7: return std::pair{uW - 1 - y, uH - 1 - x};
+        case 8: return std::pair{uW - 1 - y, x};
+        default: return std::pair{x, y};
+        }
+    };
+    RgbImg o;
+    o.W = cw; o.H = ch;
+    o.px.resize(size_t(cw) * ch * 3);
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            auto [ux, uy] = omap(x + cx, y + cy);
+            for (int k = 0; k < 3; ++k)
+                o.px[(size_t(y) * cw + x) * 3 + k] =
+                    rgb[(size_t(uy) * uW + ux) * 3 + k];
+        }
+    return o;
+}
+
 static void savePpm(const char* path, const uint8_t* rgba, int W, int H) {
     std::ofstream f(path, std::ios::binary);
     f << "P6\n" << W << " " << H << "\n255\n";
@@ -1117,48 +1620,90 @@ static void savePpm(const char* path, const uint8_t* rgba, int W, int H) {
     }
 }
 
-// Scan -> entropy mode. AC bands are always non-interleaved (ns==1);
-// DC bands may be interleaved or per-component.
-static int scanMode(const Scan& sc) {
-    if (sc.ss == 0 && sc.se == 63 && sc.ah == 0 && sc.al == 0)
-        return 0;                        // sequential full band
-    if (sc.ss == 0) return sc.ah == 0 ? 1 : 2;
-    return sc.ah == 0 ? 3 : 4;
-}
-
 int main(int argc, char** argv) {
     bool cpuMode = false, verify = false;
     int bench = 0;
+    int scaleNum = 1, scaleDenom = 1;
+    int cropW = -1, cropH = 0, cropX = 0, cropY = 0; // -1 => full image
+    std::string orientArg = "none";                  // none|auto|1..8
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--cpu") cpuMode = true;
         else if (a == "--verify") verify = true;
         else if (a == "--bench") bench = atoi(argv[++i]);
+        else if (a == "--scale") {
+            if (++i >= argc ||
+                sscanf(argv[i], "%d/%d", &scaleNum, &scaleDenom) != 2) {
+                fprintf(stderr, "--scale needs M/N (like djpeg -scale)\n");
+                return 2;
+            }
+        }
+        else if (a == "--crop") {
+            if (++i >= argc ||
+                sscanf(argv[i], "%dx%d+%d+%d", &cropW, &cropH,
+                       &cropX, &cropY) != 4) {
+                fprintf(stderr, "--crop needs WxH+X+Y\n");
+                return 2;
+            }
+        }
+        else if (a == "--orient") {
+            if (++i >= argc) { fprintf(stderr, "--orient needs arg\n"); return 2; }
+            orientArg = argv[i];
+        }
         else pos.push_back(a);
+    }
+    // djpeg -scale M/N picks the smallest DCT_scaled_size N with
+    // scale_num*8 <= scale_denom*N (jdmaster.c); we implement the
+    // classic reduced IDCTs for N in {1,2,4,8} (1/8, 1/4, 1/2, 1/1)
+    int smin = scaleDenom > 0
+                   ? (scaleNum * 8 + scaleDenom - 1) / scaleDenom : 8;
+    if (smin < 1) smin = 1;
+    if (smin > 8) smin = 8;
+    if (smin != 1 && smin != 2 && smin != 4 && smin != 8) {
+        fprintf(stderr, "unsupported DCT_scaled_size %d "
+                "(only 1/8, 1/4, 1/2 scales implemented)\n", smin);
+        return 2;
     }
     if (pos.empty() || (!cpuMode && !verify && !bench && pos.size() < 2)) {
         fprintf(stderr,
-            "usage: app [--cpu|--verify|--bench N] in.jpg [out.ppm]\n");
+            "usage: app [--cpu|--verify|--bench N|--scale M/N]\n"
+            "           [--crop WxH+X+Y] [--orient none|auto|1-8] "
+            "in.jpg [out.ppm]\n");
         return 2;
     }
     const std::string inPath = pos[0];
 
     if (cpuMode) {
+        // need the parsed header for --orient auto's EXIF value
+        int o2 = 1;
+        if (orientArg != "none") {
+            Jpg h;
+            std::ifstream f(inPath, std::ios::binary);
+            h.data.assign(std::istreambuf_iterator<char>(f), {});
+            if (!parseJpg(h)) return 1;
+            o2 = orientArg == "auto" ? h.orient : atoi(orientArg.c_str());
+            if (o2 < 1 || o2 > 8) o2 = 1;
+        }
         Ref r;
-        if (!refDecode(inPath, r, false)) return 1;
+        if (!refDecode(inPath, r, false, scaleNum, scaleDenom)) return 1;
+        int oW2 = o2 >= 5 ? r.H : r.W, oH2 = o2 >= 5 ? r.W : r.H;
+        int cx2 = std::clamp(cropX, 0, oW2), cy2 = std::clamp(cropY, 0, oH2);
+        int cw2 = cropW < 0 ? oW2 : std::min(cropW, oW2 - cx2);
+        int ch2 = cropW < 0 ? oH2 : std::min(cropH, oH2 - cy2);
+        RgbImg t = cropOrientRgb(r.rgb, r.W, r.H, o2, cx2, cy2, cw2, ch2);
         savePpm(pos[1].c_str(), [&] {
             static std::vector<uint8_t> rgba;
-            rgba.resize(size_t(r.W) * r.H * 4);
-            for (size_t i = 0; i < size_t(r.W) * r.H; ++i) {
-                rgba[i * 4] = r.rgb[i * 3];
-                rgba[i * 4 + 1] = r.rgb[i * 3 + 1];
-                rgba[i * 4 + 2] = r.rgb[i * 3 + 2];
+            rgba.resize(size_t(t.W) * t.H * 4);
+            for (size_t i = 0; i < size_t(t.W) * t.H; ++i) {
+                rgba[i * 4] = t.px[i * 3];
+                rgba[i * 4 + 1] = t.px[i * 3 + 1];
+                rgba[i * 4 + 2] = t.px[i * 3 + 2];
                 rgba[i * 4 + 3] = 255;
             }
             return rgba.data();
-        }(), r.W, r.H);
-        printf("cpu: wrote %s (%dx%d)\n", pos[1].c_str(), r.W, r.H);
+        }(), t.W, t.H);
+        printf("cpu: wrote %s (%dx%d)\n", pos[1].c_str(), t.W, t.H);
         return 0;
     }
 
@@ -1172,7 +1717,143 @@ int main(int argc, char** argv) {
     fprintf(stderr, "%dx%d %d comp  mcu %dx%d  dri %d  %zu scans %s\n",
             j.W, j.H, j.nComp, j.mcusX, j.mcusY, j.dri,
             j.scans.size(), j.progressive ? "(progressive)" : "");
-    FrameGpu fg = packComps(j);
+    FrameGpu fg = packComps(j, smin);
+    // output dims like jdmaster: ceil(image * min_ssize / 8)
+    const uint32_t outW = uint32_t(int64_t(j.W) * smin + 7) / 8;
+    const uint32_t outH = uint32_t(int64_t(j.H) * smin + 7) / 8;
+
+    // ---- orientation + crop -----------------------------------------
+    int orient = 1;
+    if (orientArg == "auto") orient = j.orient;
+    else if (orientArg != "none") orient = atoi(orientArg.c_str());
+    if (orient < 1 || orient > 8) orient = 1;
+    const uint32_t uW = outW, uH = outH;            // un-oriented dims
+    const uint32_t oW = orient >= 5 ? uH : uW;      // oriented dims
+    const uint32_t oH = orient >= 5 ? uW : uH;
+    // crop rect in oriented space (default = whole image)
+    uint32_t cw = cropW < 0 ? oW : uint32_t(cropW);
+    uint32_t ch = cropW < 0 ? oH : uint32_t(cropH);
+    cropX = std::clamp(cropX, 0, int(oW));
+    cropY = std::clamp(cropY, 0, int(oH));
+    cw = std::min(cw, oW - uint32_t(cropX));
+    ch = std::min(ch, oH - uint32_t(cropY));
+    const uint32_t fW = cw, fH = ch;                // final output dims
+    // needed region in un-oriented output space: omap applied to the
+    // crop rect (each axis maps monotonically -> corners bound it)
+    auto corner = [&](uint32_t x, uint32_t y) {
+        switch (orient) {
+        case 2: return std::pair{uW - 1 - x, y};
+        case 3: return std::pair{uW - 1 - x, uH - 1 - y};
+        case 4: return std::pair{x, uH - 1 - y};
+        case 5: return std::pair{y, x};
+        case 6: return std::pair{y, uH - 1 - x};
+        case 7: return std::pair{uW - 1 - y, uH - 1 - x};
+        case 8: return std::pair{uW - 1 - y, x};
+        default: return std::pair{x, y};
+        }
+    };
+    uint32_t ux0, uy0, ux1, uy1;
+    {
+        auto [ax, ay] = corner(uint32_t(cropX), uint32_t(cropY));
+        auto [bx, by] =
+            corner(uint32_t(cropX) + cw - 1, uint32_t(cropY) + ch - 1);
+        ux0 = std::min(ax, bx); ux1 = std::max(ax, bx) + 1;
+        uy0 = std::min(ay, by); uy1 = std::max(ay, by) + 1;
+    }
+    // needed region in source pixels (map back by 8/smin, pad by one
+    // MCU — covers fancy-upsample's +-1 comp-sample reads)
+    const int64_t marg = 8LL * std::max(j.maxH, j.maxV);
+    const int64_t srcX0 = std::clamp<int64_t>(
+        int64_t(ux0) * 8 / smin - marg, 0, j.W);
+    const int64_t srcX1 = std::clamp<int64_t>(
+        int64_t(ux1) * 8 / smin + marg, 0, j.W);
+    const int64_t srcY0 = std::clamp<int64_t>(
+        int64_t(uy0) * 8 / smin - marg, 0, j.H);
+    const int64_t srcY1 = std::clamp<int64_t>(
+        int64_t(uy1) * 8 / smin + marg, 0, j.H);
+    // AC-refine surveys (deferred) read prior coefs — and refine
+    // decode inside the shader reads coefs too. Any comp with a
+    // deferred scan therefore needs EVERY scan touching it decoded in
+    // full, else the survey walks desync on zero coefs.
+    bool defComp[4] = {};
+    for (const auto& sc : j.scans)
+        if (sc.dri == 0 && sc.totalMcus > kSurveyIv &&
+            scanMode(sc) == 4)
+            defComp[sc.sc[0].comp] = true;
+    auto scanFull = [&](const Scan& sc) {
+        for (int i = 0; i < sc.ns; ++i)
+            if (defComp[sc.sc[i].comp]) return true;
+        return false;
+    };
+    // does interval [ms,ms+n) of this scan overlap the needed rect?
+    // intervals are skipped WHOLE (a partial range can't be entered
+    // mid-stream anyway); the crop window gets an MCU of margin
+    auto ivKeep = [&](const Scan& sc, const Interval& iv) {
+        if (scanFull(sc)) return true;
+        if (srcX0 >= srcX1 || srcY0 >= srcY1) return false;
+        if (sc.ns == 1) {
+            const Comp& c = j.comps[sc.sc[0].comp];
+            // block b covers src px [b*8*maxH/hs, +8*maxH/hs)
+            const int64_t sx = 8 * j.maxH, sy = 8 * j.maxV;
+            int bx0 = int(srcX0 * c.hs / sx);
+            int bx1 = int((srcX1 * c.hs + sx - 1) / sx);
+            int by0 = int(srcY0 * c.vs / sy);
+            int by1 = int((srcY1 * c.vs + sy - 1) / sy);
+            int w = c.wib;
+            int r0 = std::max(by0, int(iv.mcuStart) / w);
+            int r1 = std::min(by1, int(iv.mcuStart + iv.nMcu - 1) / w + 1);
+            for (int r = r0; r < r1; ++r) {
+                int64_t lo = std::max<int64_t>(iv.mcuStart,
+                                               int64_t(r) * w + bx0);
+                int64_t hi = std::min<int64_t>(
+                    iv.mcuStart + iv.nMcu, int64_t(r) * w + bx1);
+                if (lo < hi) return true;
+            }
+            return false;
+        }
+        int mx0 = int(srcX0 / (8 * j.maxH));
+        int mx1 = int((srcX1 + 8 * j.maxH - 1) / (8 * j.maxH));
+        int my0 = int(srcY0 / (8 * j.maxV));
+        int my1 = int((srcY1 + 8 * j.maxV - 1) / (8 * j.maxV));
+        int w = j.mcusX;
+        int r0 = std::max(my0, int(iv.mcuStart) / w);
+        int r1 = std::min(my1, int(iv.mcuStart + iv.nMcu - 1) / w + 1);
+        for (int r = r0; r < r1; ++r) {
+            int64_t lo = std::max<int64_t>(iv.mcuStart,
+                                           int64_t(r) * w + mx0);
+            int64_t hi = std::min<int64_t>(iv.mcuStart + iv.nMcu,
+                                           int64_t(r) * w + mx1);
+            if (lo < hi) return true;
+        }
+        return false;
+    };
+
+    // ---- DRI=0 survey: virtual restart intervals --------------------
+    // A serial scan bigger than kSurveyIv MCUs gets split into virtual
+    // intervals by a cheap CPU symbol-walk (see surveyScan). AC-refine
+    // scans additionally need the coef state of prior scans — their
+    // survey is DEFERRED until those scans' GPU dispatch completed.
+    const uint32_t nScans = uint32_t(j.scans.size());
+    auto needsSurvey = [](const Scan& sc) {
+        return sc.dri == 0 && sc.totalMcus > kSurveyIv;
+    };
+    auto deferredSurvey = [&](const Scan& sc) {
+        return needsSurvey(sc) && scanMode(sc) == 4;
+    };
+    uint32_t nSurveyed = 0, nDeferred = 0;
+    {
+        SurvCoef noCoef{};
+        for (auto& sc : j.scans) {
+            if (!needsSurvey(sc) || deferredSurvey(sc)) continue;
+            if (!surveyScan(j, sc, noCoef, fg)) {
+                fprintf(stderr, "survey failed — serial decode\n");
+                sc.survSt.clear();
+                sc.intervals.assign(1, Interval{0, 0, sc.totalMcus});
+                continue;
+            }
+            nSurveyed++;
+        }
+    }
 
     // ---- upload ----
     Gpu g;
@@ -1183,37 +1864,67 @@ int main(int argc, char** argv) {
     auto scanBuf = g.ssbo((j.data.size() + 3) & ~3u, true);
     memcpy(scanBuf.mapped, j.data.data(), j.data.size());
 
-    const uint32_t nScans = uint32_t(j.scans.size());
     const uint32_t kChunkMcus = 2048;
 
-    // per-scan chunk entries concatenated into one buffer
+    // per-scan chunk entries concatenated into one buffer.
+    // Surveyed scans emit flag=2 chunks (host-preloaded st[]);
+    // deferred-survey scans emit the same mechanical MCU partition
+    // now — the survey only fills st[] at dispatch time.
     std::vector<uint32_t> ckAll, ckBase(nScans), nIvV(nScans), nGenV(nScans);
     uint32_t totalSlots = 0;
     for (uint32_t si = 0; si < nScans; ++si) {
         const Scan& sc = j.scans[si];
+        ckBase[si] = totalSlots;
+        if (deferredSurvey(sc)) {
+            // reserve + emit the fixed kSurveyIv partition now
+            const uint32_t nIv = (sc.totalMcus + kSurveyIv - 1) / kSurveyIv;
+            nIvV[si] = nIv; nGenV[si] = 1;
+            for (uint32_t i = 0; i < nIv; ++i) {
+                uint32_t nm = std::min(kSurveyIv, sc.totalMcus - i * kSurveyIv);
+                Interval viv{0, i * kSurveyIv, nm};
+                ckAll.push_back(0);
+                ckAll.push_back(i * kSurveyIv);
+                ckAll.push_back(ivKeep(sc, viv) ? nm : 0u);
+                ckAll.push_back(2u);
+            }
+            totalSlots += nIv;
+            nDeferred++;
+            continue;
+        }
         const uint32_t nIv = uint32_t(sc.intervals.size());
         uint32_t nGen = 1;
         for (const auto& iv : sc.intervals)
             nGen = std::max(nGen, (iv.nMcu + kChunkMcus - 1) / kChunkMcus);
-        ckBase[si] = totalSlots;
         nIvV[si] = nIv;
         nGenV[si] = nGen;
+        const bool surveyed = !sc.survSt.empty();
         for (uint32_t gI = 0; gI < nGen; ++gI)
             for (uint32_t i = 0; i < nIv; ++i) {
                 const Interval& iv = sc.intervals[i];
                 uint32_t ms = iv.mcuStart + gI * kChunkMcus;
                 int64_t nm = int64_t(iv.mcuStart) + iv.nMcu - int64_t(ms);
                 nm = std::clamp<int64_t>(nm, 0, kChunkMcus);
+                if (!ivKeep(sc, iv)) nm = 0;   // crop: skip whole iv
                 ckAll.push_back(gI == 0 ? sc.dataOff + iv.byteStart : 0);
                 ckAll.push_back(ms);
                 ckAll.push_back(uint32_t(nm));
-                ckAll.push_back(gI > 0 ? 1u : 0u);
+                ckAll.push_back(surveyed ? 2u : (gI > 0 ? 1u : 0u));
             }
         totalSlots += nIv * nGen;
     }
     auto ivBuf = g.ssbo(ckAll.size() * 4, true);
     memcpy(ivBuf.mapped, ckAll.data(), ckAll.size() * 4);
-    auto stBuf = g.ssbo(size_t(totalSlots) * 12 * 4);
+    auto stBuf = g.ssbo(size_t(totalSlots) * 12 * 4, true);
+    // preload host-surveyed interval states (flag=2 chunks)
+    {
+        uint32_t* stw = static_cast<uint32_t*>(stBuf.mapped);
+        for (uint32_t si = 0; si < nScans; ++si) {
+            const Scan& sc = j.scans[si];
+            if (sc.survSt.empty()) continue;
+            memcpy(stw + size_t(ckBase[si]) * 12, sc.survSt.data(),
+                   sc.survSt.size() * 4);
+        }
+    }
 
     // per-scan Huffman/quant tables at region si*kTabWords, plus one
     // recon region (final quant state) at nScans*kTabWords
@@ -1295,10 +2006,12 @@ int main(int argc, char** argv) {
                           vk::BufferUsageFlagBits::eUniformBuffer);
     memcpy(compBuf.mapped, fg.comps, sizeof(fg.comps));
 
-    auto coefBuf = g.ssbo(size_t(fg.totalBlocks) * 32 * 4, false,
+    // coefBuf is host-mapped: AC-refine surveys read prior scans'
+    // coefficients directly out of it between submits.
+    auto coefBuf = g.ssbo(size_t(fg.totalBlocks) * 32 * 4, true,
                           vk::BufferUsageFlagBits::eTransferDst);
     auto planeBuf = g.ssbo(size_t(fg.planeWords) * 4);
-    auto outBuf = g.ssbo(size_t(j.W) * j.H * 4, true);
+    auto outBuf = g.ssbo(size_t(fW) * fH * 4, true);
 
     g.bindBuf(0, scanBuf);
     g.bindBuf(1, ivBuf);
@@ -1330,11 +2043,14 @@ int main(int argc, char** argv) {
             jobs.push_back({si, gI, uint32_t(w)});
         }
     }
-    // greedy grouping into ranges whose total MCUs stay under budget
+    // greedy grouping into ranges whose total MCUs stay under budget;
+    // a deferred-survey (AC-refine, DRI=0) scan must START a submit —
+    // its st[] state is written only after all prior scans completed.
     std::vector<std::pair<uint32_t, uint32_t>> submits;
     for (uint32_t i = 0, acc = 0, start = 0; i <= uint32_t(jobs.size()); ++i) {
         if (i == uint32_t(jobs.size()) ||
-            (acc > 0 && acc + jobs[i].mcus > kSubmitMcus)) {
+            (acc > 0 && (acc + jobs[i].mcus > kSubmitMcus ||
+                         deferredSurvey(j.scans[jobs[i].si])))) {
             submits.push_back({start, i});
             start = i; acc = 0;
             if (i == uint32_t(jobs.size())) break;
@@ -1398,6 +2114,23 @@ int main(int argc, char** argv) {
             uint32_t je = j1;   // clamp range end to scanLim
             while (je > j0 && jobs[je - 1].si >= uint32_t(scanLim)) --je;
             if (je <= j0) continue;
+            Scan& sc0 = j.scans[jobs[j0].si];
+            if (deferredSurvey(sc0) && sc0.survSt.empty()) {
+                // all prior scans have completed (oneTime waits) —
+                // coefBuf.mapped now holds their coefficients, which
+                // the AC-refine survey needs for its nonzero walk.
+                if (first)   // fillBuffer hasn't run yet (scanMin skip)
+                    memset(coefBuf.mapped, 0, coefBuf.size);
+                SurvCoef cc{static_cast<const uint32_t*>(coefBuf.mapped)};
+                if (surveyScan(j, sc0, cc, fg)) {
+                    memcpy(static_cast<uint32_t*>(stBuf.mapped) +
+                               size_t(ckBase[jobs[j0].si]) * 12,
+                           sc0.survSt.data(), sc0.survSt.size() * 4);
+                } else {
+                    fprintf(stderr, "deferred survey failed (scan %u)\n",
+                            jobs[j0].si);
+                }
+            }
             g.v.oneTime([&](vk::CommandBuffer c) {
                 if (first) {   // zero coefficient buffer once, up front
                     c.fillBuffer(coefBuf.buf.get(), 0, coefBuf.size, 0);
@@ -1419,15 +2152,24 @@ int main(int argc, char** argv) {
             c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                  g.pipeLayout.get(), 0, g.dset, {});
             pc[8] = nScans * kTabWords / 4;  // tabOfs -> recon region
+            pc[9] = uint32_t(srcX0); pc[10] = uint32_t(srcY0);
+            pc[11] = uint32_t(srcX1); pc[12] = uint32_t(srcY1);
             c.pushConstants(g.pipeLayout.get(),
                             vk::ShaderStageFlagBits::eCompute, 0, 88, pc);
             c.bindPipeline(vk::PipelineBindPoint::eCompute, g.pRecon.get());
             g.barrier(c);
             c.dispatch((fg.totalBlocks + 63) / 64, 1, 1);
             g.barrier(c);
+            // upsample: output dims + min scale + crop/orient fields
+            // (different push layout — indices 9..13 get new meaning)
+            pc[0] = fW; pc[1] = fH; pc[8] = uint32_t(smin);
+            pc[9] = uint32_t(cropX); pc[10] = uint32_t(cropY);
+            pc[11] = uW; pc[12] = uH; pc[13] = uint32_t(orient);
+            c.pushConstants(g.pipeLayout.get(),
+                            vk::ShaderStageFlagBits::eCompute, 0, 88, pc);
             c.bindPipeline(vk::PipelineBindPoint::eCompute,
                            g.pUpsample.get());
-            c.dispatch((j.W + 15) / 16, (j.H + 15) / 16, 1);
+            c.dispatch((fW + 15) / 16, (fH + 15) / 16, 1);
         });
         if (stagetimes)
             fprintf(stderr, "decode (all stages): %.1f ms\n",
@@ -1467,12 +2209,14 @@ int main(int argc, char** argv) {
 
     if (pos.size() >= 2) {
         savePpm(pos[1].c_str(),
-                static_cast<const uint8_t*>(outBuf.mapped), j.W, j.H);
+                static_cast<const uint8_t*>(outBuf.mapped), fW, fH);
         printf("wrote %s\n", pos[1].c_str());
     }
 
     if (verify) {
         // coef stage: GPU zigzag-packed i16 vs libjpeg natural JCOEF
+        // (only meaningful uncropped: skipped intervals leave coef = 0)
+        if (fW == oW && fH == oH) {
         Ref ref;
         if (!refDecode(inPath, ref, true)) return 1;
         const auto* cw = static_cast<const uint32_t*>([&] {
@@ -1504,17 +2248,22 @@ int main(int argc, char** argv) {
             }
         }
         printf("coefs: %d/%d mismatch\n", bad, checked);
+        } else {
+            printf("coefs: skipped (crop)\n");
+        }
 
-        // final RGB vs libjpeg
+        // final RGB vs libjpeg (apply the same orient+crop on the ref)
         Ref rr;
-        refDecode(inPath, rr, false);
+        refDecode(inPath, rr, false, scaleNum, scaleDenom);
+        RgbImg rc = cropOrientRgb(rr.rgb, int(outW), int(outH), orient,
+                                 cropX, cropY, int(fW), int(fH));
         const auto* px = static_cast<const uint8_t*>(outBuf.mapped);
         int md = 0; double sum = 0;
-        for (int i = 0; i < j.W * j.H * 3; ++i) {
-            int d = abs(int(px[(i / 3) * 4 + i % 3]) - int(rr.rgb[i]));
+        for (uint32_t i = 0; i < fW * fH * 3; ++i) {
+            int d = abs(int(px[(i / 3) * 4 + i % 3]) - int(rc.px[i]));
             md = std::max(md, d); sum += d;
         }
-        printf("rgb: max |diff| %d  mean %.4f\n", md, sum / (j.W * j.H * 3));
+        printf("rgb: max |diff| %d  mean %.4f\n", md, sum / (fW * fH * 3));
     }
     return 0;
 }

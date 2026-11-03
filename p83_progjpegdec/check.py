@@ -126,6 +126,19 @@ def gen_cjpeg():
         jobs.append(p)
     return jobs
 
+def gen_exif():
+    """EXIF orientation 1..8 tagged files for --orient auto tests."""
+    rng, contents = _gens()
+    from PIL import Image
+    jobs = []
+    img = Image.fromarray(contents["photo"](320, 240))
+    for o in range(1, 9):
+        p = f"{CORPUS}/exif_o{o}.jpg"
+        ex = img.getexif(); ex[0x0112] = o
+        img.save(p, exif=ex, quality=90, subsampling=2)
+        jobs.append(p)
+    return jobs
+
 def gen_reject():
     """Files that must be refused cleanly (nonzero exit, no crash)."""
     import numpy as np
@@ -194,6 +207,51 @@ def verify(path):
         return False, f"rgb max|diff|={mr.group(1)} mean={mr.group(2)}"
     return True, f"{mc.group(2)} coefs"
 
+RE_SRGB = re.compile(r"rgb: max \|diff\| (\d+)")
+
+def verify_scales(path):
+    """--verify --scale {1/2,1/4,1/8}: returns (ok, compact status)."""
+    out = []
+    for s in ("1/2", "1/4", "1/8"):
+        r = subprocess.run([APP, "--verify", "--scale", s, path],
+                           capture_output=True, text=True, timeout=180)
+        m = RE_SRGB.search(r.stdout)
+        ok = r.returncode == 0 and m and m.group(1) == "0"
+        out.append((s, ok, m.group(1) if m else "?"))
+    bad = [f"{s}={d}" for s, ok, d in out if not ok]
+    return (not bad,
+            " ".join(f"s{s.split('/')[1]}={d}" for s, _, d in out))
+
+def img_dims(path):
+    from PIL import Image
+    with Image.open(path) as im:
+        return im.size
+
+def verify_ops(path):
+    """--crop on every file; --orient auto on EXIF-tagged files.
+
+    Crop rect: deterministic 40% window at 20% offset (clamped inside),
+    small enough to exercise interval skipping on bigger images."""
+    out = []
+    w, h = img_dims(path)
+    cw, ch = max(1, w * 2 // 5), max(1, h * 2 // 5)
+    cx, cy = max(0, w // 5), max(0, h // 5)
+    r = subprocess.run([APP, "--verify", "--crop",
+                        f"{cw}x{ch}+{cx}+{cy}", path],
+                       capture_output=True, text=True, timeout=180)
+    m = RE_SRGB.search(r.stdout)
+    out.append(("crop", r.returncode == 0 and m and m.group(1) == "0",
+                m.group(1) if m else "?"))
+    for o in range(1, 9):
+        if f"exif_o{o}" in path:
+            r = subprocess.run([APP, "--verify", "--orient", "auto", path],
+                               capture_output=True, text=True, timeout=180)
+            m = RE_SRGB.search(r.stdout)
+            out.append((f"or{o}", r.returncode == 0 and m and
+                        m.group(1) == "0", m.group(1) if m else "?"))
+    bad = [f"{k}={d}" for k, ok, d in out if not ok]
+    return (not bad, " ".join(f"{k}={d}" for k, _, d in out))
+
 def reject(path):
     try:
         r = subprocess.run([APP, path, "/tmp/_rej.ppm"],
@@ -208,7 +266,7 @@ def reject(path):
 
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
-    jobs = gen_pil() + gen_cjpeg()
+    jobs = gen_pil() + gen_cjpeg() + gen_exif()
     real = find_real()
     rejs = gen_reject()
     if only == "gen":
@@ -226,6 +284,21 @@ def main():
             print(f"ok   skip-unsupported {p}  {msg}")
             continue
         tag = "ok  " if res else "FAIL"
+        if res:
+            # scaled decode (1/2,1/4,1/8 reduced IDCTs) on the same file
+            sok, smsg = verify_scales(p)
+            if not sok:
+                res = False
+                msg += f"  [scale {smsg}]"
+            else:
+                msg += f"  [{smsg}]"
+            # ROI crop + EXIF orientation
+            ook, omsg = verify_ops(p)
+            if not ook:
+                res = False
+                msg += f"  [ops {omsg}]"
+            else:
+                msg += f"  [{omsg}]"
         if res: npass += 1
         else: nfail += 1; fails.append((p, msg))
         print(f"{tag} {p}  {msg}")
