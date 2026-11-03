@@ -1,0 +1,1520 @@
+// SPDX-License-Identifier: CC0-1.0
+//
+// Progressive (and baseline) JPEG DECODING in Vulkan compute shaders,
+// extending p80_gpujpegdec to multi-scan streams. Four stages:
+//
+//   1. entropy:  one invocation per restart interval per scan decodes
+//      Huffman-coded MCUs -> quantized DCT coefficients (zigzag order,
+//      i16 packed pairs). Scans dispatch one after another into a
+//      persistent coef buffer — progressive refinement scans read and
+//      update coefficients written by earlier scans. Restart markers
+//      (DRI>0) make each scan's bitstream parallel; EOBRUN and DC
+//      predictors reset at markers, so intervals decode independently.
+//   2. recon:    one invocation per 8x8 block: dequantize + libjpeg
+//      "islow" integer IDCT -> per-component u8 sample planes.
+//   3. upsample: one invocation per output pixel: libjpeg "fancy"
+//      triangle upsampling + libjpeg fixed-point YCbCr->RGB -> RGBA8.
+//
+// Progressive scan modes (jdphuff.c mirrored exactly):
+//   sequential   Ss=0..63 Ah=0  — baseline-style DC+AC per block
+//   DC first     Ss=0    Ah=0  — DC coef = pred << Al
+//   DC refine    Ss=0    Ah>0  — one correction bit per block
+//   AC first     Ss>0    Ah=0  — band coefs = v << Al, EOBRUN runs
+//   AC refine    Ss>0    Ah>0  — correction bits + new +-p1 coefs
+//
+// Interleaved scans (ns>1, DC or sequential only) iterate the MCU
+// grid; non-interleaved scans (ns=1) iterate the component's own
+// width_in_blocks x height_in_blocks raster — which can differ from
+// the MCU-aligned block grid (jdinput.c: ceil(W*hs/(maxH*8))).
+//
+//   ./app in.jpg out.ppm           decode entirely on the GPU
+//   ./app --cpu in.jpg out.ppm     libjpeg reference (for comparison)
+//   ./app --verify in.jpg          GPU decode + per-stage diff report
+//   ./app --bench N in.jpg         N decodes, prints MP/s
+//
+// Build:  g++ -std=c++23 -O2 main.cpp -o app -lvulkan -lshaderc -ljpeg
+// (no GLFW needed — compute only. PIL/libjpeg used by check.py.)
+
+#include "vkmini.hpp"
+#include <jpeglib.h>
+
+#include <chrono>
+#include <cmath>
+#include <map>
+
+// Zigzag position -> natural (row-major) index inside an 8x8 block.
+static constexpr uint8_t kZig[64] = {
+    0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63};
+
+// ============================================================
+//  JFIF parser — collects every scan of a progressive stream.
+// ============================================================
+
+struct HuffTable {
+    uint8_t counts[16]{};        // BITS: #codes of each length 1..16
+    std::vector<uint8_t> vals;   // HUFFVAL symbols in file order
+    // canonical decode tables (host-built)
+    int32_t mincode[16]{}, maxcode[16]{}, valptr[16]{};
+    uint32_t lut8[256]{};        // (len<<8)|sym, 0 = code longer than 8
+};
+
+struct Comp {
+    int id = 0, hs = 1, vs = 1, tq = 0;
+    int bw = 0, bh = 0;          // MCU-aligned block-grid dims
+    int wib = 0, hib = 0;        // width/height_in_blocks (non-interleaved)
+    int w = 0, h = 0;            // downsampled sample dims
+};
+
+struct Interval { uint32_t byteStart, mcuStart, nMcu; };
+
+struct ScanComp { int comp = 0, td = 0, ta = 0; };
+
+struct Scan {
+    int ns = 0;                  // scan component count
+    ScanComp sc[4];
+    int ss = 0, se = 63, ah = 0, al = 0;
+    int dri = 0;                 // restart interval in effect for this scan
+    uint32_t dataOff = 0, dataLen = 0;
+    std::vector<Interval> intervals;
+    uint32_t totalMcus = 0;      // MCU count in this scan's units
+    // Tables snapshot AS OF this scan — progressive files commonly
+    // redefine DHT/DQT between scans (per-scan optimized tables).
+    HuffTable dctab[4], actab[4];
+    uint16_t qt[4][64]{};
+    bool tablesChanged = false;  // differs from previous scan's set
+};
+
+struct Jpg {
+    std::vector<uint8_t> data;
+    int W = 0, H = 0;
+    Comp comps[4];
+    int nComp = 0;
+    int maxH = 1, maxV = 1;
+    int mcusX = 0, mcusY = 0;
+    int dri = 0;                 // current DRI while scanning headers
+    uint16_t qt[4][64]{};        // natural order
+    HuffTable dctab[4], actab[4];
+    bool haveDht = false;
+    bool tablesDirty = false;    // DHT/DQT seen since the last SOS —
+                                 // next scan needs a fresh upload
+    std::vector<Scan> scans;
+    int totalMcus = 0;
+    bool progressive = false;
+};
+
+static void buildCanon(HuffTable& t) {
+    int code = 0, k = 0;
+    for (int l = 0; l < 16; ++l) {
+        if (t.counts[l]) {
+            t.mincode[l] = code;
+            t.valptr[l]  = k - code;          // index = valptr + code
+            t.maxcode[l] = code + t.counts[l] - 1;
+        } else {
+            t.mincode[l] = 0; t.valptr[l] = k; t.maxcode[l] = -1;
+        }
+        code = (code + t.counts[l]) << 1;
+        k += t.counts[l];
+    }
+    // 8-bit prefix LUT: every len<=8 code covers 2^(8-len) suffixes.
+    code = 0; k = 0;
+    for (int l = 1; l <= 8; ++l) {
+        for (int i = 0; i < t.counts[l - 1]; ++i) {
+            int base = code << (8 - l), span = 1 << (8 - l);
+            uint32_t e = (uint32_t(l) << 8) | t.vals[k + i];
+            for (int s = 0; s < span; ++s) t.lut8[base + s] = e;
+            code++;
+        }
+        code <<= 1;
+        k += t.counts[l - 1];
+    }
+}
+
+// Find restart-marker boundaries inside a scan's entropy segment and
+// build the interval table (byteStart, mcuStart, nMcu) in scan units.
+
+static bool parseJpg(Jpg& j) {
+    const auto& d = j.data;
+    if (d.size() < 4 || d[0] != 0xFF || d[1] != 0xD8) {
+        fprintf(stderr, "not a JPEG (no SOI)\n");
+        return false;
+    }
+    size_t p = 2;
+    bool haveSof = false;
+    while (p + 1 < d.size()) {
+        // find next marker (FF followed by non-00)
+        if (d[p] != 0xFF) { p++; continue; }
+        uint8_t m = d[p + 1];
+        if (m == 0x00) { p += 2; continue; }   // stuffed data byte
+        if (m >= 0xD0 && m <= 0xD7) { p += 2; continue; } // stray RST
+        if (m == 0xD8 || m == 0x01) { p += 2; continue; } // SOI/TEM
+        if (m == 0xD9) break;                              // EOI
+        if (p + 3 >= d.size()) break;
+        uint32_t len = (d[p + 2] << 8) | d[p + 3];
+        const uint8_t* s = d.data() + p + 4;
+        uint32_t slen = len - 2;
+        if (p + 2 + len > d.size()) return false;          // truncated
+
+        switch (m) {
+        case 0xDB: { // DQT
+            if (!j.scans.empty()) j.tablesDirty = true;
+            uint32_t o = 0;
+            while (o < slen) {
+                int pq = s[o] >> 4, tq = s[o] & 15; o++;
+                if (tq > 3 || pq > 1 || o + (pq ? 128u : 64u) > slen) return false;
+                for (int i = 0; i < 64; ++i) {
+                    uint16_t v = pq ? (s[o] << 8) | s[o + 1] : s[o];
+                    o += pq ? 2 : 1;
+                    j.qt[tq][kZig[i]] = v;   // -> natural order
+                }
+            }
+            break;
+        }
+        case 0xC4: { // DHT (possibly several tables per segment)
+            if (!j.scans.empty()) j.tablesDirty = true;
+            uint32_t o = 0;
+            while (o < slen) {
+                if (o + 17 > slen) return false;
+                int tc = s[o] >> 4, th = s[o] & 15; o++;
+                if (th > 3 || tc > 1) return false;
+                HuffTable& t = tc ? j.actab[th] : j.dctab[th];
+                int n = 0;
+                for (int i = 0; i < 16; ++i) { t.counts[i] = s[o + i]; n += t.counts[i]; }
+                o += 16;
+                if (o + uint32_t(n) > slen || n > 256) return false;
+                t.vals.assign(s + o, s + o + n);
+                o += n;
+                j.haveDht = true;
+            }
+            break;
+        }
+        case 0xC0: case 0xC1: case 0xC2: { // SOF0/1 sequential, SOF2 progressive
+            if (s[0] != 8) {
+                fprintf(stderr, "unsupported precision %d\n", s[0]);
+                return false;
+            }
+            j.progressive = (m == 0xC2);
+            j.H = (s[1] << 8) | s[2];
+            j.W = (s[3] << 8) | s[4];
+            j.nComp = s[5];
+            if (j.nComp != 1 && j.nComp != 3) {
+                fprintf(stderr, "unsupported %d components\n", j.nComp);
+                return false;
+            }
+            for (int i = 0; i < j.nComp; ++i) {
+                Comp& c = j.comps[i];
+                c.id = s[6 + i * 3];
+                c.hs = s[7 + i * 3] >> 4;
+                c.vs = s[7 + i * 3] & 15;
+                c.tq = s[8 + i * 3];
+                j.maxH = std::max(j.maxH, c.hs);
+                j.maxV = std::max(j.maxV, c.vs);
+            }
+            haveSof = true;
+            break;
+        }
+        case 0xDD: // DRI — takes effect for all scans that follow
+            j.dri = (s[0] << 8) | s[1];
+            break;
+        case 0xDA: { // SOS — entropy data follows the header
+            Scan sc;
+            sc.ns = s[0];
+            if (sc.ns < 1 || sc.ns > 4 || sc.ns > j.nComp) {
+                fprintf(stderr, "unsupported ns=%d\n", sc.ns);
+                return false;
+            }
+            for (int i = 0; i < sc.ns; ++i) {
+                int cs = s[1 + i * 2];
+                Comp* c = nullptr;
+                int ci = -1;
+                for (int k = 0; k < j.nComp; ++k)
+                    if (j.comps[k].id == cs) { c = &j.comps[k]; ci = k; }
+                if (!c) return false;
+                sc.sc[i].comp = ci;
+                sc.sc[i].td = s[2 + i * 2] >> 4;
+                sc.sc[i].ta = s[2 + i * 2] & 15;
+                if (sc.sc[i].td > 3 || sc.sc[i].ta > 3) return false;
+            }
+            sc.ss = s[1 + sc.ns * 2];
+            sc.se = s[2 + sc.ns * 2];
+            sc.ah = s[3 + sc.ns * 2] >> 4;
+            sc.al = s[3 + sc.ns * 2] & 15;
+            sc.dri = j.dri;
+            // snapshot tables as they stand at this scan
+            for (int t = 0; t < 4; ++t) {
+                sc.dctab[t] = j.dctab[t];
+                sc.actab[t] = j.actab[t];
+                memcpy(sc.qt[t], j.qt[t], sizeof(sc.qt[t]));
+            }
+            sc.tablesChanged = j.tablesDirty;
+            j.tablesDirty = false;
+            sc.dataOff = uint32_t(p + 4 + slen);
+            // entropy data ends before the next unstuffed marker
+            size_t q = sc.dataOff;
+            while (q + 1 < d.size()) {
+                if (d[q] == 0xFF && d[q + 1] != 0x00 &&
+                    !(d[q + 1] >= 0xD0 && d[q + 1] <= 0xD7))
+                    break;
+                q++;
+            }
+            sc.dataLen = uint32_t(q - sc.dataOff);
+            j.scans.push_back(sc);
+            p = q;
+            continue;
+        }
+        default: break;
+        }
+        p += 2 + len;
+    }
+
+    if (!haveSof || !j.haveDht || j.scans.empty()) {
+        fprintf(stderr, "missing SOF/DHT/SOS\n");
+        return false;
+    }
+
+    // ---- geometry ----
+    j.mcusX = (j.W + 8 * j.maxH - 1) / (8 * j.maxH);
+    j.mcusY = (j.H + 8 * j.maxV - 1) / (8 * j.maxV);
+    j.totalMcus = j.mcusX * j.mcusY;
+    for (int i = 0; i < j.nComp; ++i) {
+        Comp& c = j.comps[i];
+        c.bw = j.mcusX * c.hs;
+        c.bh = j.mcusY * c.vs;
+        c.w = (j.W * c.hs + j.maxH - 1) / j.maxH;
+        c.h = (j.H * c.vs + j.maxV - 1) / j.maxV;
+        // jdinput.c: width_in_blocks = ceil(W*hs/(maxH*8)) — this can
+        // differ from bw (MCU-aligned); non-interleaved scans iterate
+        // this grid.
+        c.wib = (j.W * c.hs + j.maxH * 8 - 1) / (j.maxH * 8);
+        c.hib = (j.H * c.vs + j.maxV * 8 - 1) / (j.maxV * 8);
+    }
+
+    // ---- per-scan restart intervals ----
+    for (auto& sc : j.scans) {
+        uint32_t total = sc.ns == 1
+            ? uint32_t(j.comps[sc.sc[0].comp].wib) *
+              uint32_t(j.comps[sc.sc[0].comp].hib)
+            : uint32_t(j.totalMcus);
+        sc.totalMcus = total;
+        sc.intervals.push_back({0, 0, 0});
+        const uint8_t* sd = d.data() + sc.dataOff;
+        int found = 0;
+        for (uint32_t i = 0; i + 1 < sc.dataLen; ++i) {
+            if (sd[i] == 0xFF && sd[i + 1] >= 0xD0 && sd[i + 1] <= 0xD7) {
+                found++;
+                sc.intervals.back().nMcu =
+                    uint32_t(found * std::max(sc.dri, 1)) -
+                    sc.intervals.back().mcuStart;
+                sc.intervals.push_back(
+                    {i + 2, uint32_t(found) * std::max(sc.dri, 1), 0});
+                i++;
+            }
+        }
+        if (found == 0) {
+            sc.intervals.resize(1);
+            sc.intervals[0] = {0, 0, total};
+        } else {
+            sc.intervals.back().nMcu =
+                total - sc.intervals.back().mcuStart;
+        }
+    }
+    return true;
+}
+
+// ============================================================
+//  GPU buffer layouts (std430, plain int32 words throughout)
+// ============================================================
+
+// Tables buffer words:
+//   [0x000..0x0FF]  qtab: 4 x 64 natural-order quant values
+//   per table t (8 total: 0-3 DC, 4-7 AC), base = 256 + t*816:
+//     +0    mincode[16]   +16  maxcode[16]   +32  valptr[16]
+//     +48   lut8[256]     +304 huffval[256]
+static constexpr int kTabWords = 256 + 8 * 816;
+static constexpr int kQBase = 0, kHuffBase = 256;
+
+// Flat 16-bit "fused" Huffman LUT — one lookup yields the symbol AND,
+// whenever huffLen+extLen fits in the 16-bit window, the already
+// sign-extended coefficient value. Entry (u32):
+//   bit31 set   -> fused: [4:0]=totalLen [8:5]=r [12:9]=s [28:13]=val+32768
+//   bit31 clear -> plain: [4:0]=huffLen [15:8]=sym   (huffLen==0 -> invalid)
+static constexpr int kFLutWords = 8 * 65536;
+
+static int extendRef(int v, int s) {
+    return (s > 0 && v < (1 << (s - 1))) ? v - (1 << s) + 1 : v;
+}
+
+static bool sameTable(const HuffTable& a, const HuffTable& b) {
+    return !memcmp(a.counts, b.counts, sizeof(a.counts)) && a.vals == b.vals;
+}
+
+static void packFLut(const Scan& sc, std::vector<uint32_t>& fl,
+                     const Scan* prev = nullptr) {
+    if (!prev) fl.assign(kFLutWords, 0);
+    for (int t = 0; t < 8; ++t) {
+        const HuffTable& h = (t < 4) ? sc.dctab[t] : sc.actab[t - 4];
+        if (prev) {   // skip rebuild when this table is unchanged
+            const HuffTable& p =
+                (t < 4) ? prev->dctab[t] : prev->actab[t - 4];
+            if (sameTable(h, p)) continue;
+            memset(fl.data() + t * 65536, 0, 65536 * 4);
+        }
+        for (int x = 0; x < 65536; ++x) {
+            // canonical walk for the first code in this prefix
+            int len = 0, sym = 0;
+            for (int l = 1; l <= 16; ++l) {
+                int code = x >> (16 - l);
+                if (h.maxcode[l - 1] >= 0 && code <= h.maxcode[l - 1]) {
+                    len = l;
+                    sym = h.vals[h.valptr[l - 1] + code];
+                    break;
+                }
+            }
+            if (!len) continue;
+            int r = (t < 4) ? 0 : (sym >> 4), s = sym & 15;
+            if (t < 4) s = sym;                    // DC: symbol is size
+            if (len + s <= 16) {
+                int ext = (x >> (16 - len - s)) & ((1 << s) - 1);
+                int val = extendRef(ext, s);
+                fl[t * 65536 + x] = 0x80000000u | uint32_t(len + s) |
+                                    uint32_t(r << 5) | uint32_t(s << 9) |
+                                    uint32_t((val + 32768) << 13);
+            } else {
+                fl[t * 65536 + x] = uint32_t(len) | uint32_t(sym << 8);
+            }
+        }
+    }
+}
+
+static void packTables(const Scan& sc, std::vector<int32_t>& tab) {
+    tab.assign(kTabWords, 0);
+    for (int t = 0; t < 4; ++t)
+        for (int i = 0; i < 64; ++i)
+            tab[kQBase + t * 64 + i] = sc.qt[t][i];
+    for (int t = 0; t < 8; ++t) {
+        const HuffTable& h = (t < 4) ? sc.dctab[t] : sc.actab[t - 4];
+        int b = kHuffBase + t * 816;
+        for (int i = 0; i < 16; ++i) {
+            tab[b + i] = h.mincode[i];
+            tab[b + 16 + i] = h.maxcode[i];
+            tab[b + 32 + i] = h.valptr[i];
+        }
+        for (int i = 0; i < 256; ++i) {
+            tab[b + 48 + i] = int32_t(h.lut8[i]);
+            tab[b + 304 + i] = i < (int)h.vals.size() ? h.vals[i] : 0;
+        }
+    }
+}
+
+// Per-component params, 16 int32 words each (binding 4, entropy, recon
+// and upsample read it):
+//   0 hs  1 vs  2 bw  3 bh  4 w  5 h  6 qt  7 dcTab  8 acTab
+//   9 coefOfs(words)  10 planeOfs(bytes)  11 wib  12 hib  13..15 pad
+struct FrameGpu {
+    int32_t comps[4][16];
+    int32_t totalBlocks, planeWords, nIntervals;
+};
+
+static FrameGpu packComps(const Jpg& j) {
+    FrameGpu f{};
+    uint32_t coefOf = 0, planeOf = 0;
+    for (int i = 0; i < 4; ++i) {
+        const Comp& c = j.comps[i];
+        f.comps[i][0] = c.hs;  f.comps[i][1] = c.vs;
+        f.comps[i][2] = c.bw;  f.comps[i][3] = c.bh;
+        f.comps[i][4] = c.w;   f.comps[i][5] = c.h;
+        f.comps[i][6] = c.tq;
+        f.comps[i][7] = 0;             // tables now come per-scan
+        f.comps[i][8] = 0;
+        f.comps[i][9] = int32_t(coefOf);
+        f.comps[i][10] = int32_t(planeOf);
+        f.comps[i][11] = c.wib;
+        f.comps[i][12] = c.hib;
+        if (i < j.nComp) {
+            coefOf += uint32_t(c.bw) * c.bh * 32;      // 64 coefs / 2 per word
+            planeOf += uint32_t(c.bw * 8) * (c.bh * 8);    // plane bytes
+        }
+        f.totalBlocks += c.bw * c.bh;
+    }
+    f.planeWords = int32_t(planeOf / 4);
+    return f;
+}
+
+// ============================================================
+//  libjpeg reference: coefficients (jpegtran path) + RGB pixels
+// ============================================================
+
+struct Ref {
+    std::vector<uint8_t> rgb;        // W*H*3 (or gray expanded x3)
+    std::vector<int16_t> coefs[4];   // per comp, bw*bh*64, natural order
+    int cbw[4] = {}, cbh[4] = {};    // per-comp block dims (NOT MCU-padded)
+    int W = 0, H = 0;
+};
+
+static bool refDecode(const std::string& path, Ref& r, bool wantCoefs) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path.c_str()); return false; }
+    jpeg_decompress_struct cinfo{};
+    jpeg_error_mgr jerr{};
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, f);
+    jpeg_read_header(&cinfo, TRUE);
+
+    if (wantCoefs) {
+        jvirt_barray_ptr* arr = jpeg_read_coefficients(&cinfo);
+        for (int ci = 0; ci < cinfo.num_components; ++ci) {
+            jpeg_component_info* c = cinfo.comp_info + ci;
+            r.cbw[ci] = int(c->width_in_blocks);
+            r.cbh[ci] = int(c->height_in_blocks);
+            r.coefs[ci].resize(size_t(c->width_in_blocks) * c->height_in_blocks * 64);
+            for (JDIMENSION y = 0; y < c->height_in_blocks; ++y) {
+                JBLOCKARRAY row = (*cinfo.mem->access_virt_barray)(
+                    (j_common_ptr)&cinfo, arr[ci], y, 1, TRUE);
+                for (JDIMENSION x = 0; x < c->width_in_blocks; ++x)
+                    memcpy(&r.coefs[ci][(y * c->width_in_blocks + x) * 64],
+                           row[0][x], 64 * sizeof(JCOEF));
+            }
+        }
+        jpeg_finish_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        fclose(f);
+        return true;
+    }
+
+    cinfo.out_color_space = JCS_RGB;
+    cinfo.do_fancy_upsampling = TRUE;
+    jpeg_start_decompress(&cinfo);
+    r.W = int(cinfo.output_width);
+    r.H = int(cinfo.output_height);
+    r.rgb.resize(size_t(r.W) * r.H * 3);
+    while (cinfo.output_scanline < cinfo.output_height) {
+        uint8_t* row = r.rgb.data() + size_t(cinfo.output_scanline) * r.W * 3;
+        jpeg_read_scanlines(&cinfo, &row, 1);
+    }
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(f);
+    return true;
+}
+
+// ============================================================
+//  Shader 1 — entropy decode: one invocation per restart interval
+//  (per scan). mode: 0 sequential, 1 DC-first, 2 DC-refine,
+//  3 AC-first, 4 AC-refine (jdphuff.c, bit-exact).
+// ============================================================
+static const char* kEntropy = R"GLSL(
+#version 460
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) readonly buffer Scan { uint scan[]; };
+layout(set = 0, binding = 1) readonly buffer Chunks { uvec4 ck[]; };
+layout(set = 0, binding = 2) readonly buffer Tabs { uvec4 tab[]; };
+#define T(i) int(tab[tabOfs + ((i) >> 2)][(i) & 3])
+layout(set = 0, binding = 3) buffer State { uint st[]; };
+layout(set = 0, binding = 4) uniform Comps { ivec4 comps[4][4]; };
+#define CM(c, i) (comps[c][(i) >> 2][(i) & 3])
+layout(set = 0, binding = 8) readonly buffer FLut { int flut[]; };
+layout(set = 0, binding = 5) buffer Coef { uint coef[]; };
+layout(push_constant) uniform P {
+    uint W, H, mcusX, nComp, maxH, maxV, nIv, scanLen, genOfs;
+    uint mode, ns, ss, se, ah, al, totalMcus;
+    uvec4 scomp;        // per scan comp: comp | td<<8 | ta<<16
+    uint tabOfs;        // uvec4 units into tab[] for this scan's tables
+    uint flutOfs;       // int elements into flut[] for this scan's LUTs
+};
+
+const uint kTabBase = 256;          // table t base = 256 + t*816
+
+// --- bit reader: MSB-first, byte-packed words in scan[] ---
+struct BR { uint pos; uint buf; int cnt; bool end; uint wpos; uint wval;
+            uint nval; int pad; };
+
+uint byteAt(uint p) {
+    return (scan[p >> 2] >> ((p & 3u) * 8u)) & 0xFFu;
+}
+
+uint rdByte(inout BR b) {
+    if (b.end) return 0xFFu;                       // pad 1s
+    uint wp = b.pos >> 2;
+    if (wp != b.wpos) {
+        // rotate in prefetched next word, prefetch the following one
+        b.wval = (wp == b.wpos + 1u) ? b.nval : scan[wp];
+        b.nval = (wp + 1u < ((scanLen + 3u) >> 2)) ? scan[wp + 1u] : 0u;
+        b.wpos = wp;
+    }
+    uint v = (b.wval >> ((b.pos & 3u) * 8u)) & 0xFFu;
+    if (v != 0xFFu) { b.pos++; return v; }
+    // 0xFF: crawl over fill-byte run (spec allows FF+ before markers),
+    // then classify the byte that follows (jdhuff.c jpeg_fill_bit_buffer)
+    uint p = b.pos + 1;
+    uint n = 0xFFu;
+    while (n == 0xFFu && p < scanLen) {
+        n = byteAt(p);
+        if (n == 0xFFu) p++;
+    }
+    if (n == 0u) { b.pos = p + 1; b.wpos = 0xFFFFFFFEu; return 0xFFu; }
+    b.end = true;                                  // marker: stop
+    return 0xFFu;
+}
+void fill(inout BR b) {
+    // pad counts the trailing buffered bits that are marker padding, not
+    // real data — an MCU may only be skipped when nothing but pad remains.
+    while (b.cnt <= 24) {
+        uint v = rdByte(b);
+        b.buf = (b.buf << 8) | v; b.cnt += 8;
+        if (b.end) b.pad += 8;
+    }
+}
+uint peekN(inout BR b, uint n) {
+    fill(b);
+    if (uint(b.cnt) >= n) return (b.buf >> (uint(b.cnt) - n)) & ((1u << n) - 1u);
+    uint real = uint(b.cnt);
+    uint v = (b.buf & ((1u << real) - 1u)) << (n - real);
+    return v | ((1u << (n - real)) - 1u);
+}
+void eat(inout BR b, uint n) {
+    b.cnt = (uint(b.cnt) >= n) ? b.cnt - int(n) : 0;
+    if (b.pad > b.cnt) b.pad = b.cnt;   // real bits are consumed first
+    b.buf &= (b.cnt >= 32) ? 0xFFFFFFFFu : ((1u << uint(b.cnt)) - 1u);
+}
+uint get1(inout BR b) { uint v = peekN(b, 1u); eat(b, 1u); return v; }
+
+int rext(inout BR b, int s) {          // receive + extend fused
+    if (s == 0) return 0;
+    uint v = peekN(b, uint(s)); eat(b, uint(s));
+    int i = int(v);
+    int vt = 1 << (s - 1);
+    return (i < vt) ? i - (1 << s) + 1 : i;
+}
+
+// coef buffer: i16 pairs per u32 word, zigzag order — 32 words/block
+int getCoef(uint outp, int k) {
+    uint w2 = coef[outp + uint(k >> 1)];
+    int v = int((w2 >> ((k & 1) * 16)) & 0xFFFFu);
+    return (v >= 32768) ? v - 65536 : v;
+}
+void setCoef(uint outp, int k, int v) {
+    uint wi = outp + uint(k >> 1);
+    uint w2 = coef[wi];
+    uint sh = uint(k & 1) * 16u;
+    w2 = (w2 & ~(0xFFFFu << sh)) | ((uint(v) & 0xFFFFu) << sh);
+    coef[wi] = w2;
+}
+
+// ---- sequential (baseline) block: DC diff + full AC band ----
+void seqBlock(inout BR b, uint outp, uint dt, uint at, inout int pred) {
+    // -- DC: fused entry -> sign-extended diff in one lookup
+    int e = flut[flutOfs + uint(dt) * 65536u + peekN(b, 16u)];
+    bool doAc = true;
+    int diff;
+    if (e < 0) {
+        eat(b, uint(e & 0x1F));
+        diff = ((e >> 13) & 0xFFFF) - 32768;
+    } else {
+        int len = e & 0x1F;
+        if (len == 0) { doAc = false; diff = 0; }
+        else { eat(b, uint(len)); diff = rext(b, (e >> 8) & 0xFF); }
+    }
+    pred += diff;
+    uint pw = 0u, pv = uint(pred) & 0xFFFFu;
+    // -- AC: ZRL/EOB need no stores; nonzero coefs gather
+    //    into the pending word
+    if (doAc) {
+        int k = 1;
+        while (k < 64) {
+            e = flut[flutOfs + uint(at) * 65536u + peekN(b, 16u)];
+            int rr, ss, val;
+            if (e < 0) {
+                eat(b, uint(e & 0x1F));
+                rr = (e >> 5) & 0xF; ss = (e >> 9) & 0xF;
+                val = ((e >> 13) & 0xFFFF) - 32768;
+            } else {
+                int len = e & 0x1F;
+                if (len == 0) break;
+                eat(b, uint(len));
+                int sym = (e >> 8) & 0xFF;
+                rr = sym >> 4; ss = sym & 15;
+                val = (ss > 0) ? rext(b, ss) : 0;
+            }
+            if (ss == 0) {
+                if (rr == 15) { k += 16; continue; }
+                break;                // EOB
+            }
+            k += rr;
+            if (k < 64) {
+                uint wv = uint(k >> 1);
+                if (wv != pw) { coef[outp + pw] = pv; pw = wv; pv = 0u; }
+                pv |= (uint(val) & 0xFFFFu) << ((k & 1) * 16);
+            }
+            k++;
+        }
+    }
+    coef[outp + pw] = pv;
+}
+
+// ---- progressive modes (jdphuff.c) ----
+
+// DC first: coef[0] = (pred += diff) << Al
+void dcFirst(inout BR b, uint outp, uint dt, inout int pred) {
+    int e = flut[flutOfs + uint(dt) * 65536u + peekN(b, 16u)];
+    int diff = 0;
+    if (e < 0) {
+        eat(b, uint(e & 0x1F));
+        diff = ((e >> 13) & 0xFFFF) - 32768;
+    } else {
+        int len = e & 0x1F;
+        if (len > 0) { eat(b, uint(len)); diff = rext(b, (e >> 8) & 0xFF); }
+    }
+    pred += diff;
+    setCoef(outp, 0, pred << int(al));
+}
+
+// DC refine: one correction bit per block — coef[0] |= (1 << Al)
+void dcRefine(inout BR b, uint outp) {
+    if (get1(b) != 0u)
+        setCoef(outp, 0, getCoef(outp, 0) | (1 << int(al)));
+}
+
+// AC first: band Ss..Se, v << Al writes, EOBRUN zero-runs
+void acFirst(inout BR b, uint outp, uint at, inout uint eobrun) {
+    if (eobrun > 0u) { eobrun--; return; }   // EOB block: no bits read
+    int k = int(ss);
+    while (k <= int(se)) {
+        int e = flut[flutOfs + uint(at) * 65536u + peekN(b, 16u)];
+        int rr, s, val;
+        if (e < 0) {
+            eat(b, uint(e & 0x1F));
+            rr = (e >> 5) & 0xF; s = (e >> 9) & 0xF;
+            val = ((e >> 13) & 0xFFFF) - 32768;
+        } else {
+            int len = e & 0x1F;
+            if (len == 0) break;
+            eat(b, uint(len));
+            int sym = (e >> 8) & 0xFF;
+            rr = sym >> 4; s = sym & 15;
+            val = (s > 0) ? rext(b, s) : 0;
+        }
+        if (s != 0) {
+            k += rr;
+            if (k <= int(se)) setCoef(outp, k, val << int(al));
+            k++;
+        } else if (rr == 15) {       // ZRL
+            k += 16;
+        } else {                     // EOBr: 2^r + appended bits
+            eobrun = 1u << rr;
+            if (rr > 0) { eobrun += peekN(b, uint(rr)); eat(b, uint(rr)); }
+            eobrun--;                // this block consumed one
+            break;
+        }
+    }
+}
+
+// AC refine: correction bits on already-nonzero coefs, new +-p1 coefs
+void acRefine(inout BR b, uint outp, uint at, inout uint eobrun) {
+    int p1 = 1 << int(al), m1 = -p1;
+    int k = int(ss);
+    if (eobrun == 0u) {
+        while (k <= int(se)) {
+            int e = flut[flutOfs + uint(at) * 65536u + peekN(b, 16u)];
+            int r, s, newv = 0;
+            if (e < 0) {
+                eat(b, uint(e & 0x1F));
+                r = (e >> 5) & 0xF; s = (e >> 9) & 0xF;
+                if (s != 0) newv = (((e >> 13) & 0xFFFF) - 32768) << int(al);
+            } else {
+                int len = e & 0x1F;
+                if (len == 0) break;
+                eat(b, uint(len));
+                int sym = (e >> 8) & 0xFF;
+                r = sym >> 4; s = sym & 15;
+                if (s != 0)
+                    newv = (get1(b) != 0u) ? p1 : m1;
+            }
+            if (s == 0 && r != 15) {   // EOBr: rest of band = corrections
+                eobrun = 1u << r;
+                if (r > 0) { eobrun += peekN(b, uint(r)); eat(b, uint(r)); }
+                break;
+            }
+            // walk: correction bits on nonzeros, count down r zeros
+            do {
+                int v = getCoef(outp, k);
+                if (v != 0) {
+                    if (get1(b) != 0u && (v & p1) == 0)
+                        setCoef(outp, k, v + ((v >= 0) ? p1 : m1));
+                } else {
+                    r--;
+                    if (r < 0) break;      // target zero position
+                }
+                k++;
+            } while (k <= int(se));
+            if (s != 0 && k <= int(se))
+                setCoef(outp, k, newv);
+            k++;
+        }
+    }
+    if (eobrun > 0u) {
+        // rest of band (or whole block under EOBRUN): correction bits
+        for (; k <= int(se); ++k) {
+            int v = getCoef(outp, k);
+            if (v != 0 && get1(b) != 0u && (v & p1) == 0)
+                setCoef(outp, k, v + ((v >= 0) ? p1 : m1));
+        }
+        eobrun--;
+    }
+}
+
+void main() {
+    if (gl_GlobalInvocationID.x >= nIv) return;   // dispatch overrun
+    uint idx = genOfs + gl_GlobalInvocationID.x;  // work item = (iv,chunk) grid
+    uvec4 w = ck[idx];
+    if (w.z == 0u) return;                        // padded grid cell
+    BR b;
+    ivec4 pred;
+    uint eobrun = 0u;
+    if (w.w == 0u) {                              // first chunk of interval
+        b.pos = w.x; b.buf = 0u; b.cnt = 0; b.end = false;
+        b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u; b.pad = 0;
+        pred = ivec4(0);
+    } else {                                      // resume predecessor's state
+        uint s = (idx - nIv) * 12u;
+        b.pos = st[s]; b.buf = st[s + 1]; b.cnt = int(st[s + 2]);
+        b.end = st[s + 3] != 0u;
+        b.wpos = 0xFFFFFFFEu; b.wval = 0u; b.nval = 0u;
+        b.pad = int(st[s + 9]);
+        pred = ivec4(int(st[s + 4]), int(st[s + 5]),
+                     int(st[s + 6]), int(st[s + 7]));
+        eobrun = st[s + 8];
+    }
+
+    for (uint m = 0; m < w.z; ++m) {
+        int mcu = int(w.y + m);
+        if (mcu >= int(totalMcus)) break;      // malformed interval table
+        if (b.end && b.cnt <= b.pad) continue; // insufficient data: leave MCU
+        if (ns > 1u) {                         // interleaved: MCU grid
+            int mx = mcu % int(mcusX), my = mcu / int(mcusX);
+            for (int ci = 0; ci < int(ns); ++ci) {
+                uint scw = scomp[ci];
+                int comp = int(scw & 0xFFu);
+                uint dt = (scw >> 8) & 0xFFu, at = 4u + ((scw >> 16) & 0xFFu);
+                int hs = CM(comp, 0), vs = CM(comp, 1);
+                int bw = CM(comp, 2);
+                uint cofs = uint(CM(comp, 9));
+                for (int v = 0; v < vs; ++v)
+                for (int h = 0; h < hs; ++h) {
+                    int bi = (my * vs + v) * bw + mx * hs + h;
+                    uint outp = cofs + uint(bi) * 32u;
+                    switch (mode) {
+                    case 0u: seqBlock(b, outp, dt, at, pred[ci]); break;
+                    case 1u: dcFirst(b, outp, dt, pred[ci]); break;
+                    case 2u: dcRefine(b, outp); break;
+                    }
+                }
+            }
+        } else {                               // non-interleaved: block raster
+            int comp = int(scomp[0] & 0xFFu);
+            uint dt = (scomp[0] >> 8) & 0xFFu, at = 4u + ((scomp[0] >> 16) & 0xFFu);
+            int wib1 = CM(comp, 11);
+            int bw = CM(comp, 2);
+            uint cofs = uint(CM(comp, 9));
+            int bx = mcu % wib1, by = mcu / wib1;
+            uint outp = cofs + uint(by * bw + bx) * 32u;
+            switch (mode) {
+            case 0u: seqBlock(b, outp, dt, at, pred[0]); break;
+            case 1u: dcFirst(b, outp, dt, pred[0]); break;
+            case 2u: dcRefine(b, outp); break;
+            case 3u: acFirst(b, outp, at, eobrun); break;
+            case 4u: acRefine(b, outp, at, eobrun); break;
+            }
+        }
+    }
+
+    // hand bitstate + DC predictors + EOBRUN to the next generation
+    uint s = idx * 12u;
+    st[s] = b.pos; st[s + 1] = b.buf; st[s + 2] = uint(b.cnt);
+    st[s + 3] = b.end ? 1u : 0u;
+    st[s + 4] = uint(pred[0]); st[s + 5] = uint(pred[1]);
+    st[s + 6] = uint(pred[2]); st[s + 7] = uint(pred[3]);
+    st[s + 8] = eobrun; st[s + 9] = uint(b.pad);
+}
+)GLSL";
+// ============================================================
+//  Shader 2 — block reconstruction: dequant + islow int IDCT
+//  (libjpeg-turbo jidctint.c, CONST_BITS=13 PASS1_BITS=2 — bit-exact)
+// ============================================================
+static const char* kRecon = R"GLSL(
+#version 460
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 2) readonly buffer Tabs { uvec4 tab[]; };
+#define T(i) int(tab[tabOfs + ((i) >> 2)][(i) & 3])
+layout(set = 0, binding = 4) uniform Comps { ivec4 comps[4][4]; };
+#define CM(c, i) (comps[c][(i) >> 2][(i) & 3])
+layout(set = 0, binding = 5) readonly buffer Coef { uint coef[]; };
+layout(set = 0, binding = 6) writeonly buffer Planes { uint planes[]; };
+layout(push_constant) uniform P { uint W, H, mcusX, nComp, maxH, maxV,
+                                  nIv, scanLen, tabOfs; };
+
+const int zig[64] = int[64](
+    0,1,8,16,9,2,3,10,17,24,32,25,18,11,4,5,
+    12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,
+    35,42,49,56,57,50,43,36,29,22,15,23,30,37,44,51,
+    58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63);
+
+int desc(int x, int n) { return (x + (1 << (n - 1))) >> n; }
+
+// one full islow pass over 8 values (shared by both directions)
+// idx selects the 8 input strided positions; returns via ws[]
+void idct1d(in int inp[8], out int outp[8], int sc, int nsh) {
+    int z2 = inp[2] * sc, z3 = inp[6] * sc;
+    int z1 = (z2 + z3) * 4433;                    // FIX_0_541196100
+    int t2 = z1 - z3 * 15137;                     // FIX_1_847759065
+    int t3 = z1 + z2 * 6270;                      // FIX_0_765366865
+    z2 = inp[0] * sc; z3 = inp[4] * sc;
+    int t0 = (z2 + z3) << 13, t1 = (z2 - z3) << 13;
+    int t10 = t0 + t3, t13 = t0 - t3;
+    int t11 = t1 + t2, t12 = t1 - t2;
+    t0 = inp[7] * sc; t1 = inp[5] * sc;
+    t2 = inp[3] * sc; t3 = inp[1] * sc;
+    z1 = t0 + t3; z2 = t1 + t2;
+    int z3o = t0 + t2, z4 = t1 + t3;
+    int z5 = (z3o + z4) * 9633;                   // FIX_1_175875602
+    t0 *= 2446;  t1 *= 16819; t2 *= 25172; t3 *= 12299;
+    z1 *= -7373; z2 *= -20995; z3o *= -16069; z4 *= -3196;
+    z3o += z5; z4 += z5;
+    t0 += z1 + z3o; t1 += z2 + z4;
+    t2 += z2 + z3o; t3 += z1 + z4;
+    outp[0] = desc(t10 + t3, nsh); outp[7] = desc(t10 - t3, nsh);
+    outp[1] = desc(t11 + t2, nsh); outp[6] = desc(t11 - t2, nsh);
+    outp[2] = desc(t12 + t1, nsh); outp[5] = desc(t12 - t1, nsh);
+    outp[3] = desc(t13 + t0, nsh); outp[4] = desc(t13 - t0, nsh);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    // find which component this block belongs to (bounded — dispatch
+    // overrun invocations must not walk past the last component)
+    int c = 0;
+    while (c < int(nComp) - 1 && gid >= uint(CM(c, 2) * CM(c, 3))) {
+        gid -= uint(CM(c, 2) * CM(c, 3)); c++;
+    }
+    if (c >= int(nComp) || int(gid) >= CM(c, 2) * CM(c, 3)) return;
+    int bw = CM(c, 2);
+    int bx = int(gid) % bw, by = int(gid) / bw;
+    int qt = CM(c, 6);
+    uint cofs = uint(CM(c, 9));
+    uint pofs = uint(CM(c, 10)) >> 2;        // bytes -> words
+
+    // dequantize (zigzag buffer -> natural order)
+    int deq[64];
+    for (int i = 0; i < 64; i += 2) {
+        uint w2 = coef[cofs + uint(bx + by * bw) * 32u + uint(i / 2)];
+        int v0 = int(w2 & 0xFFFFu); if (v0 >= 32768) v0 -= 65536;
+        int v1 = int(w2 >> 16);     if (v1 >= 32768) v1 -= 65536;
+        deq[zig[i]]     = v0 * T(qt * 64 + zig[i]);
+        deq[zig[i + 1]] = v1 * T(qt * 64 + zig[i + 1]);
+    }
+
+    // pass 1: columns (dequant inside the pass, like jidctint)
+    int ws[64];
+    for (int col = 0; col < 8; ++col) {
+        int inp[8], outp[8];
+        for (int r = 0; r < 8; ++r) inp[r] = deq[r * 8 + col];
+        idct1d(inp, outp, 1, 11);                 // scale 1, descale 11
+        for (int r = 0; r < 8; ++r) ws[r * 8 + col] = outp[r];
+    }
+    // pass 2: rows -> u8, pack 4 per word
+    for (int r = 0; r < 8; ++r) {
+        int inp[8], outp[8];
+        for (int cc = 0; cc < 8; ++cc) inp[cc] = ws[r * 8 + cc];
+        idct1d(inp, outp, 1, 18);                 // descale 18
+        uint base = pofs + uint(by * 8 + r) * uint(bw * 2) + uint(bx * 2);
+        uint w0 = 0u, w1 = 0u;
+        for (int cc = 0; cc < 4; ++cc) {
+            int a = clamp(outp[cc] + 128, 0, 255);
+            int b = clamp(outp[cc + 4] + 128, 0, 255);
+            w0 |= uint(a) << (cc * 8);
+            w1 |= uint(b) << (cc * 8);
+        }
+        planes[base] = w0;
+        planes[base + 1] = w1;
+    }
+}
+)GLSL";
+
+// ============================================================
+//  Shader 3 — upsample + color convert (per output pixel)
+//  Mirrors jdsample.c fancy upsampling (bias +1/+2, +7/+8) and
+//  jdcolor.c fixed-point YCbCr->RGB — target: bit-exact vs libjpeg.
+// ============================================================
+static const char* kUpsample = R"GLSL(
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 4) uniform Comps { ivec4 comps[4][4]; };
+#define CM(c, i) (comps[c][(i) >> 2][(i) & 3])
+layout(set = 0, binding = 6) readonly buffer Planes { uint planes[]; };
+layout(set = 0, binding = 7) writeonly buffer OutB { uint outp[]; };
+layout(push_constant) uniform P { uint W, H, mcusX, nComp, maxH, maxV, nIv, scanLen; };
+
+// fetch one u8 sample from component c's packed plane
+int smp(int c, int x, int y) {
+    uint pofs = uint(CM(c, 10));
+    int stride = CM(c, 2) * 8;               // samples per plane row
+    uint a = pofs + uint(y * stride + x);
+    return int((planes[a >> 2] >> ((a & 3u) * 8u)) & 0xFFu);
+}
+
+int clampi(int v) { return clamp(v, 0, 255); }
+
+// upsampled component value at output pixel (x,y)
+int usamp(int c, int x, int y) {
+    int hs = CM(c, 0), vs = CM(c, 1);
+    int cw = CM(c, 4), ch = CM(c, 5);
+    int rh = int(maxH) / hs, rv = int(maxV) / vs;
+    if (rh == 1 && rv == 1)
+        return smp(c, x, y);
+    if (rh == 2 && rv == 1) {                    // h2v1 fancy
+        int j = clamp(x >> 1, 0, cw - 1);
+        if (x == 0) return smp(c, 0, y);
+        if (x == cw * 2 - 1) return smp(c, cw - 1, y);
+        if ((x & 1) == 0)
+            return (3 * smp(c, j, y) + smp(c, j - 1, y) + 1) >> 2;
+        return (3 * smp(c, j, y) + smp(c, j + 1, y) + 2) >> 2;
+    }
+    if (rh == 1 && rv == 2) {                    // h1v2 fancy
+        int i = clamp(y >> 1, 0, ch - 1);
+        int adj = clamp(i + (((y & 1) == 0) ? -1 : 1), 0, ch - 1);
+        int bias = ((y & 1) == 0) ? 1 : 2;
+        return (3 * smp(c, x, i) + smp(c, x, adj) + bias) >> 2;
+    }
+    if (rh == 2 && rv == 2 && cw > 2) {          // h2v2 fancy
+        int i = clamp(y >> 1, 0, ch - 1);
+        int i2 = clamp(i + (((y & 1) == 0) ? -1 : 1), 0, ch - 1);
+        int j = clamp(x >> 1, 0, cw - 1);
+        int this0 = 3 * smp(c, j, i) + smp(c, j, i2);   // colsum j
+        if (x == 0) return (this0 * 4 + 8) >> 4;
+        if (x == cw * 2 - 1) return (this0 * 4 + 7) >> 4;
+        int j2 = clamp(j + (((x & 1) == 0) ? -1 : 1), 0, cw - 1);
+        int adj0 = 3 * smp(c, j2, i) + smp(c, j2, i2);
+        int bias = ((x & 1) == 0) ? 8 : 7;
+        return (this0 * 3 + adj0 + bias) >> 4;
+    }
+    // integral factors: plain replication
+    int cx = clamp(x / rh, 0, cw - 1);
+    int cy = clamp(y / rv, 0, ch - 1);
+    return smp(c, cx, cy);
+}
+
+void main() {
+    uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    if (x >= W || y >= H) return;
+    int r, g, bl;
+    if (nComp == 1u) {
+        r = g = bl = usamp(0, int(x), int(y));
+    } else {
+        int yy = usamp(0, int(x), int(y));
+        int cb = usamp(1, int(x), int(y)) - 128;
+        int cr = usamp(2, int(x), int(y)) - 128;
+        r = clampi(yy + ((91881 * cr + 32768) >> 16));
+        g = clampi(yy + ((32768 - 22554 * cb - 46802 * cr) >> 16));
+        bl = clampi(yy + ((116130 * cb + 32768) >> 16));
+    }
+    outp[y * W + x] = 0xFF000000u | uint(bl) << 16 | uint(g) << 8 | uint(r);
+}
+)GLSL";
+
+// ============================================================
+//  Vulkan plumbing
+// ============================================================
+
+struct Gpu {
+    vkmini::Vk v;
+    vk::UniqueDescriptorSetLayout dsetLayout;
+    vk::UniqueDescriptorPool dpool;
+    vk::DescriptorSet dset;
+    vk::UniquePipelineLayout pipeLayout;
+    vk::UniquePipeline pEntropy, pRecon, pUpsample;
+
+    void init() {
+        v.createInstance({});
+        v.pickPhysicalDevice();
+        v.createDevice();
+        std::vector<vk::DescriptorSetLayoutBinding> binds;
+        for (uint32_t i = 0; i < 9; ++i)
+            binds.push_back({i,
+                             (i == 4)
+                                 ? vk::DescriptorType::eUniformBuffer
+                                 : vk::DescriptorType::eStorageBuffer,
+                             1, vk::ShaderStageFlagBits::eCompute});
+        dsetLayout = v.device->createDescriptorSetLayoutUnique({{}, binds});
+        std::vector<vk::DescriptorPoolSize> sz = {
+            {vk::DescriptorType::eStorageBuffer, 9},
+            {vk::DescriptorType::eUniformBuffer, 1}};
+        dpool = v.device->createDescriptorPoolUnique(
+            {vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, sz});
+        dset = v.device->allocateDescriptorSets(
+            {dpool.get(), dsetLayout.get()}).front();
+        vk::PushConstantRange pc{vk::ShaderStageFlagBits::eCompute, 0, 88};
+        pipeLayout = v.device->createPipelineLayoutUnique(
+            {{}, dsetLayout.get(), pc});
+        auto mk = [&](const char* src, const char* name) {
+            auto mod = v.shader(src, shaderc_compute_shader, name);
+            vk::ComputePipelineCreateInfo ci{};
+            ci.stage = {vk::PipelineShaderStageCreateFlags{},
+                        vk::ShaderStageFlagBits::eCompute, mod.get(), "main"};
+            ci.layout = pipeLayout.get();
+            return v.device->createComputePipelineUnique({}, ci).value;
+        };
+        pEntropy = mk(kEntropy, "entropy");
+        pRecon = mk(kRecon, "recon");
+        pUpsample = mk(kUpsample, "upsample");
+    }
+
+    vkmini::Vk::Buffer ssbo(vk::DeviceSize bytes, bool map = false,
+                            vk::BufferUsageFlags extra = {}) {
+        return v.createBuffer(
+            bytes, vk::BufferUsageFlagBits::eStorageBuffer | extra,
+            vk::MemoryPropertyFlagBits::eHostVisible |
+                vk::MemoryPropertyFlagBits::eHostCoherent,
+            map);
+    }
+
+    void bindBuf(uint32_t binding, const vkmini::Vk::Buffer& b,
+                 bool ubo = false) {
+        vk::DescriptorBufferInfo bi{b.buf.get(), 0, b.size};
+        vk::WriteDescriptorSet w{dset, binding, 0, 1,
+                                 ubo ? vk::DescriptorType::eUniformBuffer
+                                     : vk::DescriptorType::eStorageBuffer,
+                                 nullptr, &bi};
+        v.device->updateDescriptorSets(w, {});
+    }
+
+    void barrier(vk::CommandBuffer c) {
+        vk::MemoryBarrier mb{vk::AccessFlagBits::eShaderWrite |
+                                 vk::AccessFlagBits::eShaderRead,
+                             vk::AccessFlagBits::eShaderRead |
+                                 vk::AccessFlagBits::eShaderWrite};
+        c.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                          vk::PipelineStageFlagBits::eAllCommands,
+                          {}, mb, {}, {});
+    }
+};
+
+static void savePpm(const char* path, const uint8_t* rgba, int W, int H) {
+    std::ofstream f(path, std::ios::binary);
+    f << "P6\n" << W << " " << H << "\n255\n";
+    for (int i = 0; i < W * H; ++i) {
+        char px[3] = {char(rgba[i * 4]), char(rgba[i * 4 + 1]),
+                      char(rgba[i * 4 + 2])};
+        f.write(px, 3);
+    }
+}
+
+// Scan -> entropy mode. AC bands are always non-interleaved (ns==1);
+// DC bands may be interleaved or per-component.
+static int scanMode(const Scan& sc) {
+    if (sc.ss == 0 && sc.se == 63 && sc.ah == 0 && sc.al == 0)
+        return 0;                        // sequential full band
+    if (sc.ss == 0) return sc.ah == 0 ? 1 : 2;
+    return sc.ah == 0 ? 3 : 4;
+}
+
+int main(int argc, char** argv) {
+    bool cpuMode = false, verify = false;
+    int bench = 0;
+    std::vector<std::string> pos;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--cpu") cpuMode = true;
+        else if (a == "--verify") verify = true;
+        else if (a == "--bench") bench = atoi(argv[++i]);
+        else pos.push_back(a);
+    }
+    if (pos.empty() || (!cpuMode && !verify && !bench && pos.size() < 2)) {
+        fprintf(stderr,
+            "usage: app [--cpu|--verify|--bench N] in.jpg [out.ppm]\n");
+        return 2;
+    }
+    const std::string inPath = pos[0];
+
+    if (cpuMode) {
+        Ref r;
+        if (!refDecode(inPath, r, false)) return 1;
+        savePpm(pos[1].c_str(), [&] {
+            static std::vector<uint8_t> rgba;
+            rgba.resize(size_t(r.W) * r.H * 4);
+            for (size_t i = 0; i < size_t(r.W) * r.H; ++i) {
+                rgba[i * 4] = r.rgb[i * 3];
+                rgba[i * 4 + 1] = r.rgb[i * 3 + 1];
+                rgba[i * 4 + 2] = r.rgb[i * 3 + 2];
+                rgba[i * 4 + 3] = 255;
+            }
+            return rgba.data();
+        }(), r.W, r.H);
+        printf("cpu: wrote %s (%dx%d)\n", pos[1].c_str(), r.W, r.H);
+        return 0;
+    }
+
+    // ---- parse on host ----
+    Jpg j;
+    {
+        std::ifstream f(inPath, std::ios::binary);
+        j.data.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    if (!parseJpg(j)) return 1;
+    fprintf(stderr, "%dx%d %d comp  mcu %dx%d  dri %d  %zu scans %s\n",
+            j.W, j.H, j.nComp, j.mcusX, j.mcusY, j.dri,
+            j.scans.size(), j.progressive ? "(progressive)" : "");
+    FrameGpu fg = packComps(j);
+
+    // ---- upload ----
+    Gpu g;
+    g.init();
+
+    // ---- one-time upload: scan data, chunk grid, state slots, tables ----
+    // Whole file as scan buffer: interval byteStarts are file-absolute.
+    auto scanBuf = g.ssbo((j.data.size() + 3) & ~3u, true);
+    memcpy(scanBuf.mapped, j.data.data(), j.data.size());
+
+    const uint32_t nScans = uint32_t(j.scans.size());
+    const uint32_t kChunkMcus = 2048;
+
+    // per-scan chunk entries concatenated into one buffer
+    std::vector<uint32_t> ckAll, ckBase(nScans), nIvV(nScans), nGenV(nScans);
+    uint32_t totalSlots = 0;
+    for (uint32_t si = 0; si < nScans; ++si) {
+        const Scan& sc = j.scans[si];
+        const uint32_t nIv = uint32_t(sc.intervals.size());
+        uint32_t nGen = 1;
+        for (const auto& iv : sc.intervals)
+            nGen = std::max(nGen, (iv.nMcu + kChunkMcus - 1) / kChunkMcus);
+        ckBase[si] = totalSlots;
+        nIvV[si] = nIv;
+        nGenV[si] = nGen;
+        for (uint32_t gI = 0; gI < nGen; ++gI)
+            for (uint32_t i = 0; i < nIv; ++i) {
+                const Interval& iv = sc.intervals[i];
+                uint32_t ms = iv.mcuStart + gI * kChunkMcus;
+                int64_t nm = int64_t(iv.mcuStart) + iv.nMcu - int64_t(ms);
+                nm = std::clamp<int64_t>(nm, 0, kChunkMcus);
+                ckAll.push_back(gI == 0 ? sc.dataOff + iv.byteStart : 0);
+                ckAll.push_back(ms);
+                ckAll.push_back(uint32_t(nm));
+                ckAll.push_back(gI > 0 ? 1u : 0u);
+            }
+        totalSlots += nIv * nGen;
+    }
+    auto ivBuf = g.ssbo(ckAll.size() * 4, true);
+    memcpy(ivBuf.mapped, ckAll.data(), ckAll.size() * 4);
+    auto stBuf = g.ssbo(size_t(totalSlots) * 12 * 4);
+
+    // per-scan Huffman/quant tables at region si*kTabWords, plus one
+    // recon region (final quant state) at nScans*kTabWords
+    auto tabBuf = g.ssbo(size_t(nScans + 1) * kTabWords * 4, true);
+    for (auto& sc : j.scans) {
+        for (auto& t : sc.dctab) buildCanon(t);
+        for (auto& t : sc.actab) buildCanon(t);
+    }
+    {
+        std::vector<int32_t> tab;
+        for (uint32_t si = 0; si < nScans; ++si) {
+            tab.clear();
+            packTables(j.scans[si], tab);
+            memcpy(static_cast<int32_t*>(tabBuf.mapped) + size_t(si) * kTabWords,
+                   tab.data(), tab.size() * 4);
+        }
+        // recon region: only the quant tables are used (final state)
+        std::vector<int32_t> qtReg(kTabWords, 0);
+        for (int t = 0; t < 4; ++t)
+            for (int i = 0; i < 64; ++i)
+                qtReg[kQBase + t * 64 + i] = j.qt[t][i];
+        memcpy(static_cast<int32_t*>(tabBuf.mapped) +
+                   size_t(nScans) * kTabWords,
+               qtReg.data(), qtReg.size() * 4);
+    }
+
+    // per-scan fast LUTs at region si*kFLutWords (dedup table slots
+    // identical to the previous scan's — cjpeg re-emits some tables)
+    auto flutBuf = g.ssbo(size_t(nScans) * kFLutWords * 4, true);
+    {
+        std::vector<uint32_t> fl(kFLutWords), flPrev;
+        const Scan* prev = nullptr;
+        for (uint32_t si = 0; si < nScans; ++si) {
+            const Scan& sc = j.scans[si];
+            for (int t = 0; t < 8; ++t) {
+                const HuffTable& h = (t < 4) ? sc.dctab[t] : sc.actab[t - 4];
+                if (prev &&
+                    sameTable(h, (t < 4) ? prev->dctab[t] : prev->actab[t - 4])) {
+                    memcpy(fl.data() + t * 65536, flPrev.data() + t * 65536,
+                           65536 * 4);
+                    continue;
+                }
+                memset(fl.data() + t * 65536, 0, 65536 * 4);
+                // canonical walk for the first code in each 16-bit prefix
+                for (int x = 0; x < 65536; ++x) {
+                    int len = 0, sym = 0;
+                    for (int l = 1; l <= 16; ++l) {
+                        int code = x >> (16 - l);
+                        if (h.maxcode[l - 1] >= 0 && code <= h.maxcode[l - 1]) {
+                            len = l;
+                            sym = h.vals[h.valptr[l - 1] + code];
+                            break;
+                        }
+                    }
+                    if (!len) continue;
+                    int r = (t < 4) ? 0 : (sym >> 4), s = sym & 15;
+                    if (t < 4) s = sym;
+                    if (len + s <= 16) {
+                        int ext = (x >> (16 - len - s)) & ((1 << s) - 1);
+                        int val = extendRef(ext, s);
+                        fl[t * 65536 + x] =
+                            0x80000000u | uint32_t(len + s) |
+                            uint32_t(r << 5) | uint32_t(s << 9) |
+                            uint32_t((val + 32768) << 13);
+                    } else {
+                        fl[t * 65536 + x] = uint32_t(len) | uint32_t(sym << 8);
+                    }
+                }
+            }
+            memcpy(static_cast<uint32_t*>(flutBuf.mapped) +
+                       size_t(si) * kFLutWords,
+                   fl.data(), fl.size() * 4);
+            flPrev = fl;
+            prev = &sc;
+        }
+    }
+
+    auto compBuf = g.ssbo(sizeof(fg.comps), true,
+                          vk::BufferUsageFlagBits::eUniformBuffer);
+    memcpy(compBuf.mapped, fg.comps, sizeof(fg.comps));
+
+    auto coefBuf = g.ssbo(size_t(fg.totalBlocks) * 32 * 4, false,
+                          vk::BufferUsageFlagBits::eTransferDst);
+    auto planeBuf = g.ssbo(size_t(fg.planeWords) * 4);
+    auto outBuf = g.ssbo(size_t(j.W) * j.H * 4, true);
+
+    g.bindBuf(0, scanBuf);
+    g.bindBuf(1, ivBuf);
+    g.bindBuf(2, tabBuf);
+    g.bindBuf(3, stBuf);
+    g.bindBuf(4, compBuf, true);
+    g.bindBuf(5, coefBuf);
+    g.bindBuf(6, planeBuf);
+    g.bindBuf(7, outBuf);
+    g.bindBuf(8, flutBuf);
+
+    // ---- dispatch grouping: a single multi-second submit can get killed
+    // by the driver's job watchdog on some GPUs — group (scan,generation)
+    // dispatches into submits bounded by total MCU work. Files that fit
+    // the budget stay single-submit.
+    const uint32_t kSubmitMcus = getenv("SUBMITMCUS")
+        ? uint32_t(atoi(getenv("SUBMITMCUS"))) : 32768;
+    struct Job { uint32_t si, gI, mcus; };
+    std::vector<Job> jobs;
+    for (uint32_t si = 0; si < nScans; ++si) {
+        const Scan& sc = j.scans[si];
+        for (uint32_t gI = 0; gI < nGenV[si]; ++gI) {
+            uint64_t w = 0;
+            for (const auto& iv : sc.intervals) {
+                int64_t nm = int64_t(iv.mcuStart) + iv.nMcu -
+                             int64_t(iv.mcuStart + gI * kChunkMcus);
+                w += uint64_t(std::clamp<int64_t>(nm, 0, kChunkMcus));
+            }
+            jobs.push_back({si, gI, uint32_t(w)});
+        }
+    }
+    // greedy grouping into ranges whose total MCUs stay under budget
+    std::vector<std::pair<uint32_t, uint32_t>> submits;
+    for (uint32_t i = 0, acc = 0, start = 0; i <= uint32_t(jobs.size()); ++i) {
+        if (i == uint32_t(jobs.size()) ||
+            (acc > 0 && acc + jobs[i].mcus > kSubmitMcus)) {
+            submits.push_back({start, i});
+            start = i; acc = 0;
+            if (i == uint32_t(jobs.size())) break;
+        }
+        acc += jobs[i].mcus;
+    }
+
+    uint32_t pc[22] = {uint32_t(j.W),     uint32_t(j.H),
+                       uint32_t(j.mcusX), uint32_t(j.nComp),
+                       uint32_t(j.maxH),  uint32_t(j.maxV),
+                       0,                 uint32_t(j.data.size()),
+                       0u,                0u,
+                       0u,                0u,
+                       0u,                0u,
+                       0u,                0u,
+                       0u,                0u,
+                       0u,                0u};
+    auto recordEntropy = [&](vk::CommandBuffer c, uint32_t j0, uint32_t j1) {
+        c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                             g.pipeLayout.get(), 0, g.dset, {});
+        c.bindPipeline(vk::PipelineBindPoint::eCompute, g.pEntropy.get());
+        uint32_t lastSi = ~0u;
+        for (uint32_t ji = j0; ji < j1; ++ji) {
+            const Job& jb = jobs[ji];
+            const uint32_t si = jb.si;
+            const Scan& sc = j.scans[si];
+            const uint32_t nIv = nIvV[si];
+            if (si != lastSi) {           // scan-level fields once per scan
+                pc[6] = nIv;
+                pc[9] = uint32_t(scanMode(sc));
+                pc[10] = uint32_t(sc.ns);
+                pc[11] = uint32_t(sc.ss);
+                pc[12] = uint32_t(sc.se);
+                pc[13] = uint32_t(sc.ah);
+                pc[14] = uint32_t(sc.al);
+                pc[15] = sc.totalMcus;
+                for (int i = 0; i < sc.ns; ++i)
+                    pc[16 + i] = uint32_t(sc.sc[i].comp) |
+                                 (uint32_t(sc.sc[i].td) << 8) |
+                                 (uint32_t(sc.sc[i].ta) << 16);
+                pc[20] = si * kTabWords / 4; // tabOfs in uvec4 units
+                pc[21] = si * kFLutWords;    // flutOfs in int units
+                lastSi = si;
+            }
+            pc[8] = ckBase[si] + jb.gI * nIv;
+            c.pushConstants(g.pipeLayout.get(),
+                            vk::ShaderStageFlagBits::eCompute, 0, 88, pc);
+            g.barrier(c);
+            c.dispatch((nIv + 31) / 32, 1, 1);
+        }
+    };
+    auto decodeOnce = [&] {
+        bool stagetimes = getenv("STAGE") != nullptr;
+        auto t0 = std::chrono::steady_clock::now();
+        int scanLim = getenv("SCANLIMIT") ? atoi(getenv("SCANLIMIT")) : int(nScans);
+        const uint32_t scanMin = getenv("SCANMIN")
+            ? uint32_t(atoi(getenv("SCANMIN"))) : 0;
+        bool first = true;
+        for (auto [j0, j1] : submits) {
+            if (jobs[j0].si < scanMin || jobs[j0].si >= uint32_t(scanLim)) continue;
+            uint32_t je = j1;   // clamp range end to scanLim
+            while (je > j0 && jobs[je - 1].si >= uint32_t(scanLim)) --je;
+            if (je <= j0) continue;
+            g.v.oneTime([&](vk::CommandBuffer c) {
+                if (first) {   // zero coefficient buffer once, up front
+                    c.fillBuffer(coefBuf.buf.get(), 0, coefBuf.size, 0);
+                    vk::MemoryBarrier mb0{
+                        vk::AccessFlagBits::eTransferWrite,
+                        vk::AccessFlagBits::eShaderRead |
+                            vk::AccessFlagBits::eShaderWrite};
+                    c.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                      vk::PipelineStageFlagBits::eComputeShader,
+                                      {}, mb0, {}, {});
+                }
+                recordEntropy(c, j0, je);
+            });
+            first = false;
+        }
+        if (getenv("DBG")) fprintf(stderr, "submits=%zu, recon submit\n",
+                                   submits.size());
+        g.v.oneTime([&](vk::CommandBuffer c) {
+            c.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                 g.pipeLayout.get(), 0, g.dset, {});
+            pc[8] = nScans * kTabWords / 4;  // tabOfs -> recon region
+            c.pushConstants(g.pipeLayout.get(),
+                            vk::ShaderStageFlagBits::eCompute, 0, 88, pc);
+            c.bindPipeline(vk::PipelineBindPoint::eCompute, g.pRecon.get());
+            g.barrier(c);
+            c.dispatch((fg.totalBlocks + 63) / 64, 1, 1);
+            g.barrier(c);
+            c.bindPipeline(vk::PipelineBindPoint::eCompute,
+                           g.pUpsample.get());
+            c.dispatch((j.W + 15) / 16, (j.H + 15) / 16, 1);
+        });
+        if (stagetimes)
+            fprintf(stderr, "decode (all stages): %.1f ms\n",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+    };
+
+    if (bench > 0) {
+        decodeOnce();  // warm-up
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < bench; ++i) decodeOnce();
+        double s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        double mp = double(j.W) * j.H * bench / 1e6;
+        printf("%d decodes in %.2fs -> %.1f MP/s (%.1f MPix/decode)\n",
+               bench, s, mp / s, double(j.W) * j.H / 1e6);
+        return 0;
+    }
+
+    decodeOnce();
+
+    if (verify || getenv("DBG")) {
+        auto countNz = [&](vkmini::Vk::Buffer& b, const char* name) {
+            const void* m = b.mapped ? b.mapped
+                                     : g.v.device->mapMemory(b.mem.get(), 0, b.size);
+            const auto* w = static_cast<const uint32_t*>(m);
+            size_t nz = 0;
+            for (size_t i = 0; i < b.size / 4; ++i) nz += w[i] != 0;
+            fprintf(stderr, "%s: %zu/%zu nonzero words\n", name, nz,
+                    b.size / 4);
+            if (!b.mapped) g.v.device->unmapMemory(b.mem.get());
+        };
+        countNz(coefBuf, "coef");
+        countNz(planeBuf, "planes");
+        countNz(outBuf, "out");
+    }
+
+    if (pos.size() >= 2) {
+        savePpm(pos[1].c_str(),
+                static_cast<const uint8_t*>(outBuf.mapped), j.W, j.H);
+        printf("wrote %s\n", pos[1].c_str());
+    }
+
+    if (verify) {
+        // coef stage: GPU zigzag-packed i16 vs libjpeg natural JCOEF
+        Ref ref;
+        if (!refDecode(inPath, ref, true)) return 1;
+        const auto* cw = static_cast<const uint32_t*>([&] {
+            void* m = g.v.device->mapMemory(coefBuf.mem.get(), 0,
+                                            coefBuf.size);
+            return m;
+        }());
+        int bad = 0, checked = 0, printed = 0;
+        for (int c = 0; c < j.nComp; ++c) {
+            const Comp& cc = j.comps[c];
+            const auto& rc = ref.coefs[c];
+            uint32_t base = uint32_t(fg.comps[c][9]);
+            for (int by = 0; by < ref.cbh[c]; ++by)
+            for (int bx = 0; bx < ref.cbw[c]; ++bx) {
+                int b = by * cc.bw + bx;      // GPU layout is MCU-padded
+                for (int z = 0; z < 64; ++z) {
+                    uint32_t w = cw[base + b * 32 + z / 2];
+                    int v = int((w >> ((z & 1) * 16)) & 0xFFFF);
+                    if (v >= 32768) v -= 65536;
+                    checked++;
+                    int rv = rc[size_t(by * ref.cbw[c] + bx) * 64 + kZig[z]];
+                    if (v != rv) {
+                        bad++;
+                        if (printed++ < 30)
+                            printf("  c%d blk%d (bx%d by%d) z%d: gpu %d ref %d\n",
+                                   c, b, bx, by, z, v, rv);
+                    }
+                }
+            }
+        }
+        printf("coefs: %d/%d mismatch\n", bad, checked);
+
+        // final RGB vs libjpeg
+        Ref rr;
+        refDecode(inPath, rr, false);
+        const auto* px = static_cast<const uint8_t*>(outBuf.mapped);
+        int md = 0; double sum = 0;
+        for (int i = 0; i < j.W * j.H * 3; ++i) {
+            int d = abs(int(px[(i / 3) * 4 + i % 3]) - int(rr.rgb[i]));
+            md = std::max(md, d); sum += d;
+        }
+        printf("rgb: max |diff| %d  mean %.4f\n", md, sum / (j.W * j.H * 3));
+    }
+    return 0;
+}

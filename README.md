@@ -164,6 +164,7 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | 80 | `p80_gpujpegdec` | JPEG decode in compute: per-restart-interval Huffman + islow IDCT + fancy upsample, bit-exact vs libjpeg | [How to decode JPEG entirely on the GPU — parallel Huffman entropy decode in a compute shader](https://techoverflow.net/2026/11/03/how-to-decode-jpeg-entirely-on-the-gpu-parallel-huffman-entropy-decode-in-a-compute-shader/) |
 | 81 | `p81_resize` | Image resize in compute: PIL-exact separable filters (nearest/box/bilinear/hamming/bicubic/lanczos), int32 22-bit accumulation, u8 intermediate, GPU-side pack — bit-exact vs Pillow | [How to resize images in a Vulkan compute shader — bit-exact vs Pillow](https://techoverflow.net/2026/11/03/how-to-resize-images-in-a-vulkan-compute-shader-bit-exact-vs-pillow/) |
 | 82 | `p82_pixfmt` | Pixel-format conversion in compute: rgb/rgba/bgr/gray/YCbCr/HSV both ways, one word per invocation, integer-mantissa exact rounding — bit-exact vs PIL convert | [How to convert pixel formats in a Vulkan compute shader — bit-exact vs Pillow](https://techoverflow.net/2026/11/03/how-to-convert-pixel-formats-in-a-vulkan-compute-shader-bit-exact-vs-pillow/) |
+| 83 | `p83_progjpegdec` | Progressive JPEG decode in compute: multi-scan spectral selection + successive approximation, EOBRUN, per-scan Huffman tables, restart-interval parallelism — bit-exact vs libjpeg | [How to decode progressive JPEG entirely on the GPU](https://techoverflow.net/2026/11/03/how-to-decode-progressive-jpeg-entirely-on-the-gpu/) |
 
 ## Sample output
 
