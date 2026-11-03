@@ -162,6 +162,7 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | 67 | `p67_pngenc` | PNG encode in compute: adaptive scanline filters + zlib stored-block framing + Adler-32 | [How to encode PNG in a Vulkan compute shader](https://techoverflow.net/2026/09/27/how-to-encode-png-in-a-vulkan-compute-shader/) |
 | 68 | `p68_pngdec` | PNG decode in compute: full DEFLATE inflate (stored/fixed/dynamic + LZ77) + unfiltering | [How to decode PNG entirely on the GPU — DEFLATE inflate in a compute shader](https://techoverflow.net/2026/09/27/how-to-decode-png-entirely-on-the-gpu-deflate-inflate-in-a-compute-shader/) |
 | 80 | `p80_gpujpegdec` | JPEG decode in compute: per-restart-interval Huffman + islow IDCT + fancy upsample, bit-exact vs libjpeg | [How to decode JPEG entirely on the GPU — parallel Huffman entropy decode in a compute shader](https://techoverflow.net/2026/09/27/how-to-decode-jpeg-entirely-on-the-gpu-parallel-huffman-entropy-decode-in-a-compute-shader/) |
+| 81 | `p81_resize` | Image resize in compute: PIL-exact separable filters (nearest/box/bilinear/hamming/bicubic/lanczos), int32 22-bit accumulation, u8 intermediate, GPU-side pack — bit-exact vs Pillow | [How to resize images in a Vulkan compute shader — bit-exact vs Pillow](https://techoverflow.net/2026/11/03/how-to-resize-images-in-a-vulkan-compute-shader-bit-exact-vs-pillow/) |
 
 ## Sample output
 
