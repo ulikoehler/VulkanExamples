@@ -161,6 +161,7 @@ Windowed examples (`p12`, `p19`, `p20`, `p36`, `p46`) run under
 | 58 | `p58_httpmjpeg` | HTTP `multipart/x-mixed-replace` ingest: socket parser → FFmpeg JPEG decode → upload → render | [How to ingest HTTP MJPEG camera streams into Vulkan](https://techoverflow.net/2026/09/27/how-to-ingest-http-mjpeg-camera-streams-into-vulkan/) |
 | 67 | `p67_pngenc` | PNG encode in compute: adaptive scanline filters + zlib stored-block framing + Adler-32 | [How to encode PNG in a Vulkan compute shader](https://techoverflow.net/2026/09/27/how-to-encode-png-in-a-vulkan-compute-shader/) |
 | 68 | `p68_pngdec` | PNG decode in compute: full DEFLATE inflate (stored/fixed/dynamic + LZ77) + unfiltering | [How to decode PNG entirely on the GPU — DEFLATE inflate in a compute shader](https://techoverflow.net/2026/09/27/how-to-decode-png-entirely-on-the-gpu-deflate-inflate-in-a-compute-shader/) |
+| 80 | `p80_gpujpegdec` | JPEG decode in compute: per-restart-interval Huffman + islow IDCT + fancy upsample, bit-exact vs libjpeg | [How to decode JPEG entirely on the GPU — parallel Huffman entropy decode in a compute shader](https://techoverflow.net/2026/09/27/how-to-decode-jpeg-entirely-on-the-gpu-parallel-huffman-entropy-decode-in-a-compute-shader/) |
 
 ## Sample output
 
